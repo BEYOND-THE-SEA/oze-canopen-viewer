@@ -24,7 +24,29 @@ pub struct MessageSender {
     emcy_error_register: String,
     emcy_data: String,
     
+    // SDO parameters
+    sdo_node_id: String,
+    sdo_index: String,
+    sdo_subindex: String,
+    sdo_data: String,
+    sdo_preset: Cia402Object,
+    
+    // PDO Config parameters
+    pdo_config_node_id: String,
+    
     write_sender: mpsc::Sender<WriteCommand>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cia402Object {
+    Custom,
+    Controlword,
+    StatusWord,
+    ModesOfOperation,
+    TargetPosition,
+    ProfileVelocity,
+    ProfileAcceleration,
+    ProfileDeceleration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +56,8 @@ enum MessageType {
     Pdo,
     Raw,
     Emcy,
+    Sdo,
+    PdoConfig,
 }
 
 impl MessageType {
@@ -44,14 +68,18 @@ impl MessageType {
             MessageType::Pdo => "PDO",
             MessageType::Raw => "Raw CAN",
             MessageType::Emcy => "EMCY",
+            MessageType::Sdo => "SDO (CIA 402)",
+            MessageType::PdoConfig => "PDO Config",
         }
     }
     
-    fn all() -> [MessageType; 5] {
+    fn all() -> [MessageType; 7] {
         [
             MessageType::Sync,
             MessageType::Nmt,
             MessageType::Pdo,
+            MessageType::Sdo,
+            MessageType::PdoConfig,
             MessageType::Raw,
             MessageType::Emcy,
         ]
@@ -70,6 +98,12 @@ impl MessageSender {
             emcy_error_code: String::from("1000"),
             emcy_error_register: String::from("00"),
             emcy_data: String::from("00 00 00 00 00"),
+            sdo_node_id: String::from("1"),
+            sdo_index: String::from("6040"),
+            sdo_subindex: String::from("00"),
+            sdo_data: String::from("06 00"),
+            sdo_preset: Cia402Object::Controlword,
+            pdo_config_node_id: String::from("1"),
             write_sender,
         }
     }
@@ -103,6 +137,12 @@ impl MessageSender {
                 }
                 MessageType::Pdo => {
                     self.show_pdo_ui(ui);
+                }
+                MessageType::Sdo => {
+                    self.show_sdo_ui(ui);
+                }
+                MessageType::PdoConfig => {
+                    self.show_pdo_config_ui(ui);
                 }
                 MessageType::Raw => {
                     self.show_raw_ui(ui);
@@ -291,6 +331,162 @@ impl MessageSender {
                 } else {
                     log::error!("Invalid error code format");
                 }
+            } else {
+                log::error!("Invalid node ID format");
+            }
+        }
+    }
+    
+    fn show_sdo_ui(&mut self, ui: &mut Ui) {
+        // CIA 402 preset selector
+        ui.horizontal(|ui| {
+            ui.label("CIA 402 Preset:");
+            ComboBox::from_id_salt("cia402_preset")
+                .selected_text(format!("{:?}", self.sdo_preset))
+                .show_ui(ui, |ui| {
+                    if ui.selectable_value(&mut self.sdo_preset, Cia402Object::Custom, "Custom").clicked() {
+                        // Keep current values
+                    }
+                    if ui.selectable_value(&mut self.sdo_preset, Cia402Object::Controlword, "Controlword (0x6040)").clicked() {
+                        self.sdo_index = String::from("6040");
+                        self.sdo_subindex = String::from("00");
+                        self.sdo_data = String::from("06 00");
+                    }
+                    if ui.selectable_value(&mut self.sdo_preset, Cia402Object::StatusWord, "Statusword (0x6041)").clicked() {
+                        self.sdo_index = String::from("6041");
+                        self.sdo_subindex = String::from("00");
+                        self.sdo_data = String::from("00 00");
+                    }
+                    if ui.selectable_value(&mut self.sdo_preset, Cia402Object::ModesOfOperation, "Modes of Operation (0x6060)").clicked() {
+                        self.sdo_index = String::from("6060");
+                        self.sdo_subindex = String::from("00");
+                        self.sdo_data = String::from("01");
+                    }
+                    if ui.selectable_value(&mut self.sdo_preset, Cia402Object::TargetPosition, "Target Position (0x607A)").clicked() {
+                        self.sdo_index = String::from("607A");
+                        self.sdo_subindex = String::from("00");
+                        self.sdo_data = String::from("00 00 00 00");
+                    }
+                    if ui.selectable_value(&mut self.sdo_preset, Cia402Object::ProfileVelocity, "Profile Velocity (0x6081)").clicked() {
+                        self.sdo_index = String::from("6081");
+                        self.sdo_subindex = String::from("00");
+                        self.sdo_data = String::from("E8 03 00 00");
+                    }
+                    if ui.selectable_value(&mut self.sdo_preset, Cia402Object::ProfileAcceleration, "Profile Acceleration (0x6083)").clicked() {
+                        self.sdo_index = String::from("6083");
+                        self.sdo_subindex = String::from("00");
+                        self.sdo_data = String::from("88 13 00 00");
+                    }
+                    if ui.selectable_value(&mut self.sdo_preset, Cia402Object::ProfileDeceleration, "Profile Deceleration (0x6084)").clicked() {
+                        self.sdo_index = String::from("6084");
+                        self.sdo_subindex = String::from("00");
+                        self.sdo_data = String::from("88 13 00 00");
+                    }
+                });
+        });
+        
+        ui.separator();
+        
+        ui.horizontal(|ui| {
+            ui.label("Node ID:");
+            ui.add(TextEdit::singleline(&mut self.sdo_node_id)
+                .desired_width(60.0)
+                .hint_text("1"));
+        });
+        
+        ui.horizontal(|ui| {
+            ui.label("Index (hex):");
+            ui.add(TextEdit::singleline(&mut self.sdo_index)
+                .desired_width(100.0)
+                .hint_text("6040"));
+        });
+        
+        ui.horizontal(|ui| {
+            ui.label("Subindex (hex):");
+            ui.add(TextEdit::singleline(&mut self.sdo_subindex)
+                .desired_width(60.0)
+                .hint_text("00"));
+        });
+        
+        ui.horizontal(|ui| {
+            ui.label("Data (hex, ≤4 bytes):");
+            ui.add(TextEdit::singleline(&mut self.sdo_data)
+                .desired_width(200.0)
+                .hint_text("06 00"));
+        });
+        
+        ui.label("ℹ️ SDO TX COB-ID: 0x600 + Node ID");
+        ui.separator();
+        
+        if ui.button("📤 Send SDO Download").clicked() {
+            if let Ok(node_id) = self.sdo_node_id.parse::<u8>() {
+                if let Ok(index) = u16::from_str_radix(&self.sdo_index, 16) {
+                    if let Ok(subindex) = u8::from_str_radix(&self.sdo_subindex, 16) {
+                        if let Ok(data) = parse_hex_data(&self.sdo_data) {
+                            if data.len() <= 4 {
+                                let _ = self.write_sender.try_send(WriteCommand::SendSdoDownload {
+                                    node_id,
+                                    index,
+                                    subindex,
+                                    data,
+                                });
+                            } else {
+                                log::error!("SDO data too long: max 4 bytes for expedited transfer");
+                            }
+                        } else {
+                            log::error!("Invalid data format");
+                        }
+                    } else {
+                        log::error!("Invalid subindex format");
+                    }
+                } else {
+                    log::error!("Invalid index format");
+                }
+            } else {
+                log::error!("Invalid node ID format");
+            }
+        }
+    }
+    
+    fn show_pdo_config_ui(&mut self, ui: &mut Ui) {
+        ui.label("🔧 Configuration PDO automatique");
+        ui.separator();
+        
+        ui.horizontal(|ui| {
+            ui.label("Node ID:");
+            ui.add(TextEdit::singleline(&mut self.pdo_config_node_id)
+                .desired_width(60.0)
+                .hint_text("1"));
+        });
+        
+        ui.separator();
+        
+        ui.heading("TPDO1 → Statusword on SYNC");
+        ui.label("Configure automatiquement TPDO1 pour envoyer:");
+        ui.label("• Statusword (0x6041) à chaque message SYNC");
+        ui.label("• COB-ID: 0x180 + Node ID");
+        ui.label("• Type de transmission: 0x01 (SYNC cyclique chaque SYNC)");
+        
+        ui.separator();
+        
+        ui.label("ℹ️ Séquence correcte envoyée:");
+        ui.label("1. NMT Pre-Operational");
+        ui.label("2. Disable TPDO1 (0x1800:01)");
+        ui.label("3. Clear Mapping (0x1A00:00 = 0)");
+        ui.label("4. Map Statusword (0x1A00:01 = 0x60410020)");
+        ui.label("5. Set Mapping Count (0x1A00:00 = 1)");
+        ui.label("6. Enable TPDO1 (0x1800:01)");
+        ui.label("7. NMT Operational");
+        ui.label("8. Set Transmission Type (0x1800:02 = 0x01)");
+        
+        ui.separator();
+        
+        if ui.button("🚀 Configurer TPDO1 Statusword").clicked() {
+            if let Ok(node_id) = self.pdo_config_node_id.parse::<u8>() {
+                let _ = self.write_sender.try_send(WriteCommand::ConfigureTpdo1Statusword {
+                    node_id,
+                });
+                log::info!("Configuration TPDO1 lancée pour le node {}", node_id);
             } else {
                 log::error!("Invalid node ID format");
             }

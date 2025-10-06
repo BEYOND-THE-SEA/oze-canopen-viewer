@@ -29,6 +29,10 @@ pub enum WriteCommand {
     SendPdo { cob_id: u32, data: Vec<u8> },
     /// Send an Emergency message
     SendEmcy { node_id: u8, error_code: u16, error_register: u8, data: [u8; 5] },
+    /// Send an SDO Download (write to object dictionary)
+    SendSdoDownload { node_id: u8, index: u16, subindex: u8, data: Vec<u8> },
+    /// Configure TPDO1 for Statusword on SYNC
+    ConfigureTpdo1Statusword { node_id: u8 },
 }
 
 /// Struct representing the state of the CAN interface and received messages.
@@ -191,6 +195,87 @@ impl Driver {
                     log::info!("EMCY message sent successfully from node {}: error_code=0x{:04X}", node_id, error_code);
                 }
             }
+            WriteCommand::SendSdoDownload { node_id, index, subindex, data } => {
+                self.send_sdo_download(node_id, index, subindex, &data).await;
+            }
+            WriteCommand::ConfigureTpdo1Statusword { node_id } => {
+                log::info!("Configuring TPDO1 for Statusword (0x6041) on node {}", node_id);
+                
+                // Étape 1: NMT Pre-Operational
+                let nmt_pre_op = NmtCommand::new(NmtCommandSpecifier::EnterPreOperational, node_id);
+                if let Err(e) = self.co.send_nmt(nmt_pre_op).await {
+                    log::error!("Failed to send NMT Pre-Operational: {:?}", e);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                
+                // Étape 2: Désactiver TPDO1 (COB-ID avec bit 31 = 1)
+                let cob_id_disabled = 0x80000180u32 + u32::from(node_id);
+                self.send_sdo_download(node_id, 0x1800, 0x01, &cob_id_disabled.to_le_bytes().to_vec()).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                
+                // Étape 3: Effacer le mapping (mettre le nombre d'objets à 0)
+                self.send_sdo_download(node_id, 0x1A00, 0x00, &[0x00]).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                
+                // Étape 4: Configurer le mapping pour Statusword (0x6041, 32 bits)
+                // Format: 0xIIIISSLL (Index + Subindex + Length en bits)
+                let mapping: u32 = 0x60410020; // 0x6041 subindex 0x00, 32 bits (0x20)
+                self.send_sdo_download(node_id, 0x1A00, 0x01, &mapping.to_le_bytes().to_vec()).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                
+                // Étape 5: Activer le mapping (1 objet mappé)
+                self.send_sdo_download(node_id, 0x1A00, 0x00, &[0x01]).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                
+                // Étape 6: Activer TPDO1 (COB-ID sans bit 31)
+                let cob_id_enabled = 0x00000180u32 + u32::from(node_id);
+                self.send_sdo_download(node_id, 0x1800, 0x01, &cob_id_enabled.to_le_bytes().to_vec()).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                
+                // Étape 7: NMT Operational
+                let nmt_op = NmtCommand::new(NmtCommandSpecifier::StartRemoteNode, node_id);
+                if let Err(e) = self.co.send_nmt(nmt_op).await {
+                    log::error!("Failed to send NMT Operational: {:?}", e);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                
+                // Étape 8: Configurer le type de transmission (0x01 = SYNC cyclique à chaque SYNC)
+                self.send_sdo_download(node_id, 0x1800, 0x02, &[0x01]).await;
+                
+                log::info!("TPDO1 configured successfully for node {}", node_id);
+            }
+        }
+    }
+    
+    async fn send_sdo_download(&mut self, node_id: u8, index: u16, subindex: u8, data: &[u8]) {
+        let sdo_tx_cob_id = 0x600 + u16::from(node_id);
+        let mut sdo_data = Vec::with_capacity(8);
+        
+        // SDO Download Expedited (for data <= 4 bytes)
+        if data.len() <= 4 {
+            // Command byte: 0x23 = Initiate download expedited, 4 bytes specified
+            let n = (4 - data.len()) as u8;
+            let ccs = 0x20 | (n << 2) | 0x03; // Expedited + size indicated + size
+            
+            sdo_data.push(ccs);
+            sdo_data.extend_from_slice(&index.to_le_bytes());
+            sdo_data.push(subindex);
+            sdo_data.extend_from_slice(data);
+            // Pad to 8 bytes
+            while sdo_data.len() < 8 {
+                sdo_data.push(0);
+            }
+        } else {
+            log::error!("SDO segmented transfer not implemented yet. Data size: {} bytes", data.len());
+            return;
+        }
+        
+        let packet = TxPacket { cob_id: sdo_tx_cob_id, data: sdo_data };
+        if let Err(e) = self.co.tx.send(packet).await {
+            log::error!("Failed to send SDO Download: {:?}", e);
+        } else {
+            log::info!("SDO Download sent to node {}: index=0x{:04X}, subindex=0x{:02X}, data={:02X?}", 
+                node_id, index, subindex, data);
         }
     }
 
