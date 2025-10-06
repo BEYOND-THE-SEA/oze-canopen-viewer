@@ -7,6 +7,7 @@ pub mod filter_panel;
 pub mod gui;
 pub mod message_cached;
 pub mod message_row;
+pub mod message_sender;
 pub mod pinned_filter;
 pub mod theme;
 pub mod viewer;

@@ -1,10 +1,11 @@
 use crate::{
     bitrate::RatesData,
     chart::{self, Chart},
-    driver::{Control, ControlCommand, State},
+    driver::{Control, ControlCommand, State, WriteCommand},
     filter::GlobalFilter,
     filter_panel::FilterPanel,
     message_cached::MessageCached,
+    message_sender::MessageSender,
     pinned_filter::PinnedFilters,
     theme::{theme, OZON_GRAY, OZON_PINK},
     viewer::Viewer,
@@ -16,7 +17,7 @@ use oze_canopen::{
 };
 use std::{cell::RefCell, collections::VecDeque, rc::Rc, sync::Arc};
 use tokio::{
-    sync::{watch, Mutex},
+    sync::{watch, mpsc, Mutex},
     time::Instant,
 };
 
@@ -30,8 +31,10 @@ pub struct Gui {
     chart: chart::Chart,
     last: Instant,
     fps: VecDeque<f64>,
+    bus_load_history: VecDeque<f64>,
     global_filter: Rc<RefCell<GlobalFilter>>,
     filter_panel: FilterPanel,
+    message_sender: MessageSender,
 
     format: RxMessageToStringFormat,
 
@@ -43,6 +46,8 @@ pub struct Gui {
     connection: Connection,
     stopped: bool,
     driver_ctrl: watch::Sender<Control>,
+    write_sender: mpsc::Sender<WriteCommand>,
+    bitrate: Arc<Mutex<RatesData>>,
 }
 
 impl Gui {
@@ -51,6 +56,7 @@ impl Gui {
         driver: watch::Receiver<State>,
         driver_ctrl: watch::Sender<Control>,
         bitrate: Arc<Mutex<RatesData>>,
+        write_sender: mpsc::Sender<WriteCommand>,
     ) -> Self {
         theme(&cc.egui_ctx);
 
@@ -64,6 +70,7 @@ impl Gui {
 
         Self {
             fps: VecDeque::new(),
+            bus_load_history: VecDeque::new(),
             data: VecDeque::new(),
             pinned_filters: PinnedFilters::default(),
             info: CanOpenInfo::default(),
@@ -71,14 +78,17 @@ impl Gui {
             format: RxMessageToStringFormat::Hex,
             viewer: Viewer::new(global_filter.clone()),
             filter_panel: FilterPanel::new(global_filter.clone()),
+            message_sender: MessageSender::new(write_sender.clone()),
             last: Instant::now(),
-            chart: Chart::new(bitrate),
+            chart: Chart::new(bitrate.clone()),
             stopped: false,
             global_filter,
             can_name_raw,
             bitrate_raw,
             driver_ctrl,
             driver,
+            write_sender,
+            bitrate,
         }
     }
 
@@ -129,6 +139,37 @@ impl Gui {
         }
 
         fps.round()
+    }
+
+    fn calc_bus_load(&mut self) -> Option<f64> {
+        use tokio::runtime::Handle;
+        
+        if let Some(configured_bitrate) = self.connection.bitrate {
+            let rates = Handle::current().block_on(async {
+                self.bitrate.lock().await.clone()
+            });
+            
+            if let Some(last_rate) = rates.last() {
+                let current_bps = last_rate[1];
+                let percentage = (current_bps / f64::from(configured_bitrate)) * 100.0;
+                let clamped_percentage = percentage.min(100.0).max(0.0);
+                
+                // Ajouter à l'historique
+                self.bus_load_history.push_back(clamped_percentage);
+                
+                // Garder une fenêtre glissante de 50 échantillons
+                while self.bus_load_history.len() > 50 {
+                    self.bus_load_history.pop_front();
+                }
+                
+                // Calculer la moyenne glissante
+                if !self.bus_load_history.is_empty() {
+                    let avg = self.bus_load_history.iter().sum::<f64>() / self.bus_load_history.len() as f64;
+                    return Some(avg);
+                }
+            }
+        }
+        None
     }
 
     fn show_connect_ui(&mut self, ui: &mut Ui) {
@@ -223,6 +264,18 @@ impl eframe::App for Gui {
                 ui.separator();
                 ui.label(format!("packets={}", self.data.len()));
 
+                ui.separator();
+                if let Some(bus_load) = self.calc_bus_load() {
+                    let color = if bus_load > 80.0 {
+                        egui::Color32::RED
+                    } else if bus_load > 50.0 {
+                        egui::Color32::YELLOW
+                    } else {
+                        egui::Color32::GREEN
+                    };
+                    ui.colored_label(color, format!("Bus: {:.1}%", bus_load));
+                }
+
                 ui.with_layout(Layout::right_to_left(egui::Align::RIGHT), |ui| {
                     ui.label(format!("{fps} FPS",));
                 });
@@ -235,6 +288,20 @@ impl eframe::App for Gui {
 
         self.viewer.message_row.format = self.format;
         self.pinned_filters.message_row.format = self.format;
+        
+        // Left side panel for message sender
+        egui::SidePanel::left("message_sender_panel")
+            .resizable(true)
+            .default_width(350.0)
+            .min_width(300.0)
+            .show(ctx, |ui| {
+                ui.add_enabled_ui(connected, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        self.message_sender.ui(ui);
+                    });
+                });
+            });
+        
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_enabled_ui(connected, |ui| {
                 self.chart.ui(ui);

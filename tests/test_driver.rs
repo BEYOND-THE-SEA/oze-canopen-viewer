@@ -35,7 +35,8 @@ mod tests {
 
         let (state_snd, state_rcv) = watch::channel(driver::State::default());
         let (ctrl_snd, ctrl_rcv) = watch::channel(initial_control.clone());
-        let drv = driver::Driver::new(state_snd, ctrl_rcv);
+        let (_write_snd, write_rcv) = tokio::sync::mpsc::channel(100);
+        let drv = driver::Driver::new(state_snd, ctrl_rcv, write_rcv);
         let driver_handle = drv.start_thread();
 
         sleep(Duration::from_millis(100)).await;

@@ -1,12 +1,12 @@
 use clap::Parser;
 use oze_canopen::interface::Connection;
 use oze_canopen_viewer::bitrate;
-use oze_canopen_viewer::driver::{self, Control};
+use oze_canopen_viewer::driver::{self, Control, WriteCommand};
 use oze_canopen_viewer::gui::Gui;
 use std::sync::Arc;
 use std::thread;
 use tokio::runtime::Runtime;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch, mpsc, Mutex};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -31,6 +31,7 @@ fn main() -> eframe::Result<()> {
 
     let (state_snd, state_rcv) = watch::channel(driver::State::default());
     let (ctrl_snd, ctrl_rcv) = watch::channel(initial_control.clone());
+    let (write_snd, write_rcv) = mpsc::channel::<WriteCommand>(100);
 
     let bitrates = Arc::new(Mutex::new(Vec::new()));
     let bitrates_thr = bitrates.clone();
@@ -41,7 +42,7 @@ fn main() -> eframe::Result<()> {
 
     thread::spawn(move || {
         rt.block_on(async {
-            let drv = driver::Driver::new(state_snd, ctrl_rcv);
+            let drv = driver::Driver::new(state_snd, ctrl_rcv, write_rcv);
             let br = bitrate::Bitrate::new(drv.co.info.clone(), bitrates_thr.clone());
             drv.start_thread();
             br.start_thread();
@@ -68,6 +69,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "OZON CanOpen Viewer",
         native_options,
-        Box::new(|cc| Ok(Box::new(Gui::new(cc, state_rcv, ctrl_snd, bitrates)))),
+        Box::new(|cc| Ok(Box::new(Gui::new(cc, state_rcv, ctrl_snd, bitrates, write_snd)))),
     )
 }
