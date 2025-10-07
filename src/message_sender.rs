@@ -18,12 +18,6 @@ pub struct MessageSender {
     raw_cob_id: String,
     raw_data: String,
     
-    // EMCY parameters
-    emcy_node_id: String,
-    emcy_error_code: String,
-    emcy_error_register: String,
-    emcy_data: String,
-    
     // SDO parameters
     sdo_node_id: String,
     sdo_index: String,
@@ -55,7 +49,6 @@ enum MessageType {
     Nmt,
     Pdo,
     Raw,
-    Emcy,
     Sdo,
     PdoConfig,
 }
@@ -67,13 +60,12 @@ impl MessageType {
             MessageType::Nmt => "NMT",
             MessageType::Pdo => "PDO",
             MessageType::Raw => "Raw CAN",
-            MessageType::Emcy => "EMCY",
             MessageType::Sdo => "SDO (CIA 402)",
             MessageType::PdoConfig => "PDO Config",
         }
     }
     
-    fn all() -> [MessageType; 7] {
+    fn all() -> [MessageType; 6] {
         [
             MessageType::Sync,
             MessageType::Nmt,
@@ -81,7 +73,6 @@ impl MessageType {
             MessageType::Sdo,
             MessageType::PdoConfig,
             MessageType::Raw,
-            MessageType::Emcy,
         ]
     }
 }
@@ -94,10 +85,6 @@ impl MessageSender {
             nmt_command: NmtCommandSpecifier::StartRemoteNode,
             raw_cob_id: String::from("180"),
             raw_data: String::from("00 00 00 00 00 00 00 00"),
-            emcy_node_id: String::from("1"),
-            emcy_error_code: String::from("1000"),
-            emcy_error_register: String::from("00"),
-            emcy_data: String::from("00 00 00 00 00"),
             sdo_node_id: String::from("1"),
             sdo_index: String::from("6040"),
             sdo_subindex: String::from("00"),
@@ -146,9 +133,6 @@ impl MessageSender {
                 }
                 MessageType::Raw => {
                     self.show_raw_ui(ui);
-                }
-                MessageType::Emcy => {
-                    self.show_emcy_ui(ui);
                 }
             }
         });
@@ -269,70 +253,6 @@ impl MessageSender {
                 }
             } else {
                 log::error!("Invalid COB-ID format");
-            }
-        }
-    }
-    
-    fn show_emcy_ui(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            ui.label("Node ID:");
-            ui.add(TextEdit::singleline(&mut self.emcy_node_id)
-                .desired_width(60.0)
-                .hint_text("1"));
-        });
-        
-        ui.horizontal(|ui| {
-            ui.label("Error Code (hex):");
-            ui.add(TextEdit::singleline(&mut self.emcy_error_code)
-                .desired_width(100.0)
-                .hint_text("1000"));
-        });
-        
-        ui.horizontal(|ui| {
-            ui.label("Error Register (hex):");
-            ui.add(TextEdit::singleline(&mut self.emcy_error_register)
-                .desired_width(60.0)
-                .hint_text("00"));
-        });
-        
-        ui.horizontal(|ui| {
-            ui.label("Manufacturer Data (hex):");
-            ui.add(TextEdit::singleline(&mut self.emcy_data)
-                .desired_width(150.0)
-                .hint_text("00 00 00 00 00"));
-        });
-        
-        ui.label("ℹ️ EMCY COB-ID: 0x080 + Node ID");
-        ui.separator();
-        
-        if ui.button("📤 Send EMCY").clicked() {
-            if let Ok(node_id) = self.emcy_node_id.parse::<u8>() {
-                if let Ok(error_code) = u16::from_str_radix(&self.emcy_error_code, 16) {
-                    if let Ok(error_register) = u8::from_str_radix(&self.emcy_error_register, 16) {
-                        if let Ok(data_vec) = parse_hex_data(&self.emcy_data) {
-                            if data_vec.len() == 5 {
-                                let mut data = [0u8; 5];
-                                data.copy_from_slice(&data_vec);
-                                let _ = self.write_sender.try_send(WriteCommand::SendEmcy {
-                                    node_id,
-                                    error_code,
-                                    error_register,
-                                    data,
-                                });
-                            } else {
-                                log::error!("Manufacturer data must be exactly 5 bytes");
-                            }
-                        } else {
-                            log::error!("Invalid manufacturer data format");
-                        }
-                    } else {
-                        log::error!("Invalid error register format");
-                    }
-                } else {
-                    log::error!("Invalid error code format");
-                }
-            } else {
-                log::error!("Invalid node ID format");
             }
         }
     }

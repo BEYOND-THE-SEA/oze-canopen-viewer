@@ -11,12 +11,64 @@ use oze_canopen::{
 use std::io::Cursor;
 use tokio::time::Instant;
 
+/// Heartbeat message containing NMT state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Heartbeat {
+    pub state: NmtState,
+    pub raw_value: u8,
+}
+
+/// NMT State values from Heartbeat messages
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NmtState {
+    BootUp,              // 0x00
+    Stopped,             // 0x04
+    Operational,         // 0x05
+    PreOperational,      // 0x7F
+    Unknown,             // Other values
+}
+
+impl Heartbeat {
+    pub fn from_byte(byte: u8) -> Self {
+        let state = match byte {
+            0x00 => NmtState::BootUp,
+            0x04 => NmtState::Stopped,
+            0x05 => NmtState::Operational,
+            0x7F => NmtState::PreOperational,
+            _ => NmtState::Unknown,
+        };
+        Heartbeat {
+            state,
+            raw_value: byte,
+        }
+    }
+}
+
+impl NmtState {
+    pub fn as_str(&self) -> &str {
+        match self {
+            NmtState::BootUp => "Boot-up",
+            NmtState::Stopped => "Stopped",
+            NmtState::Operational => "Operational",
+            NmtState::PreOperational => "Pre-Operational",
+            NmtState::Unknown => "Unknown",
+        }
+    }
+}
+
+impl fmt::Display for NmtState {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum RxMessageAdditional {
     SdoTx(SdoResponse),
     SdoRx(SdoRequest),
     Nmt(NmtCommand),
     Emcy(Emcy),
+    Heartbeat(Heartbeat),
     None,
 }
 
@@ -112,6 +164,9 @@ impl RxMessageAdditional {
             RxMessageAdditional::Emcy(n) => {
                 format!("{n:?}")
             }
+            RxMessageAdditional::Heartbeat(h) => {
+                format!("Heartbeat: {} (0x{:02X})", h.state.as_str(), h.raw_value)
+            }
             RxMessageAdditional::None => String::new(),
         }
     }
@@ -135,6 +190,9 @@ impl fmt::Display for RxMessageAdditional {
                     "{:?} {:X} reg {:X} data {:X?}",
                     n.code, n.vendor_code, n.error_register, n.data
                 )
+            }
+            RxMessageAdditional::Heartbeat(h) => {
+                write!(f, "State: {}", h.state)
             }
             RxMessageAdditional::None => write!(f, ""),
         }
@@ -178,8 +236,16 @@ impl MessageCached {
                     RxMessageAdditional::None
                 }
             }
-            RxMessageType::Guarding
-            | RxMessageType::Lss
+            RxMessageType::Guarding => {
+                // Parse Heartbeat message (1 byte containing NMT state)
+                if !msg.data.is_empty() {
+                    let heartbeat = Heartbeat::from_byte(msg.data[0]);
+                    RxMessageAdditional::Heartbeat(heartbeat)
+                } else {
+                    RxMessageAdditional::None
+                }
+            }
+            RxMessageType::Lss
             | RxMessageType::Pdo
             | RxMessageType::Sync
             | RxMessageType::Unknown => RxMessageAdditional::None,

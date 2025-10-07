@@ -27,8 +27,6 @@ pub enum WriteCommand {
     SendRaw { cob_id: u32, data: Vec<u8> },
     /// Send a PDO (Process Data Object)
     SendPdo { cob_id: u32, data: Vec<u8> },
-    /// Send an Emergency message
-    SendEmcy { node_id: u8, error_code: u16, error_register: u8, data: [u8; 5] },
     /// Send an SDO Download (write to object dictionary)
     SendSdoDownload { node_id: u8, index: u16, subindex: u8, data: Vec<u8> },
     /// Configure TPDO1 for Statusword on SYNC
@@ -179,20 +177,6 @@ impl Driver {
                     log::error!("Failed to send PDO message: {:?}", e);
                 } else {
                     log::info!("PDO message sent successfully: COB-ID=0x{:03X}", cob_id);
-                }
-            }
-            WriteCommand::SendEmcy { node_id, error_code, error_register, data } => {
-                let emcy_cob_id = 0x080 + u16::from(node_id);
-                let mut emcy_data = Vec::with_capacity(8);
-                emcy_data.extend_from_slice(&error_code.to_le_bytes());
-                emcy_data.push(error_register);
-                emcy_data.extend_from_slice(&data);
-                
-                let packet = TxPacket { cob_id: emcy_cob_id, data: emcy_data };
-                if let Err(e) = self.co.tx.send(packet).await {
-                    log::error!("Failed to send EMCY message: {:?}", e);
-                } else {
-                    log::info!("EMCY message sent successfully from node {}: error_code=0x{:04X}", node_id, error_code);
                 }
             }
             WriteCommand::SendSdoDownload { node_id, index, subindex, data } => {

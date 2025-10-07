@@ -1,5 +1,6 @@
 use crate::{
     bitrate::RatesData,
+    bus_stats::BusStats,
     chart::{self, Chart},
     driver::{Control, ControlCommand, State, WriteCommand},
     filter::GlobalFilter,
@@ -32,6 +33,7 @@ pub struct Gui {
     last: Instant,
     fps: VecDeque<f64>,
     bus_load_history: VecDeque<f64>,
+    bus_stats: BusStats,
     global_filter: Rc<RefCell<GlobalFilter>>,
     filter_panel: FilterPanel,
     message_sender: MessageSender,
@@ -71,6 +73,7 @@ impl Gui {
         Self {
             fps: VecDeque::new(),
             bus_load_history: VecDeque::new(),
+            bus_stats: BusStats::new(),
             data: VecDeque::new(),
             pinned_filters: PinnedFilters::default(),
             info: CanOpenInfo::default(),
@@ -105,6 +108,8 @@ impl Gui {
 
     fn get_data_from_driver(&mut self) -> bool {
         let driver = self.driver.borrow();
+        let now = Instant::now();
+        
         for i in &driver.data {
             if let Some(last) = self.data.front() {
                 if i.index <= last.index {
@@ -112,6 +117,9 @@ impl Gui {
                 }
             }
 
+            // Update bus statistics
+            self.bus_stats.on_message(i.msg.msg.cob_id, now);
+            
             self.pinned_filters.push_data(i);
             if !self.global_filter.borrow().filter(i) {
                 self.data.push_front(i.clone());
@@ -165,11 +173,162 @@ impl Gui {
                 // Calculer la moyenne glissante
                 if !self.bus_load_history.is_empty() {
                     let avg = self.bus_load_history.iter().sum::<f64>() / self.bus_load_history.len() as f64;
+                    
+                    // Update bus statistics
+                    self.bus_stats.update_load(avg);
+                    self.bus_stats.calculate_msg_rate();
+                    self.bus_stats.calculate_cob_id_rates(Instant::now());
+                    
                     return Some(avg);
                 }
             }
         }
         None
+    }
+    
+    fn show_dashboard(&self, ui: &mut Ui) {
+        use egui::Color32;
+        
+        ui.group(|ui| {
+            ui.heading("📊 Bus Statistics");
+            ui.separator();
+            
+            ui.horizontal(|ui| {
+                // Occupation section
+                ui.vertical(|ui| {
+                    ui.label("🔋 Bus Occupation");
+                    ui.horizontal(|ui| {
+                        ui.label("Current:");
+                        let color = if self.bus_stats.current_load() > 80.0 {
+                            Color32::RED
+                        } else if self.bus_stats.current_load() > 50.0 {
+                            Color32::YELLOW
+                        } else {
+                            Color32::GREEN
+                        };
+                        ui.colored_label(color, format!("{:.1}%", self.bus_stats.current_load()));
+                    });
+                    ui.label(format!("Peak: {:.1}%", self.bus_stats.peak_load()));
+                    ui.label(format!("Average: {:.1}%", self.bus_stats.avg_load()));
+                });
+                
+                ui.separator();
+                
+                // Message rate section
+                ui.vertical(|ui| {
+                    ui.label("📬 Message Rate");
+                    ui.label(format!("Current: {:.0} msg/s", self.bus_stats.current_msg_rate()));
+                    ui.label(format!("Peak: {:.0} msg/s", self.bus_stats.peak_msg_rate()));
+                    ui.label(format!("Average: {:.1} msg/s", self.bus_stats.avg_msg_rate()));
+                });
+                
+                ui.separator();
+                
+                // Timing analysis section
+                ui.vertical(|ui| {
+                    ui.label("⏱️ Inter-Frame Timing");
+                    if let Some(min_gap) = self.bus_stats.min_gap() {
+                        ui.label(format!("Min: {:.2} ms", min_gap));
+                    } else {
+                        ui.label("Min: --");
+                    }
+                    if let Some(max_gap) = self.bus_stats.max_gap() {
+                        ui.label(format!("Max: {:.1} ms", max_gap));
+                    } else {
+                        ui.label("Max: --");
+                    }
+                    if let Some(avg_gap) = self.bus_stats.avg_gap() {
+                        ui.label(format!("Avg: {:.2} ms", avg_gap));
+                    } else {
+                        ui.label("Avg: --");
+                    }
+                });
+                
+                ui.separator();
+                
+                // Total messages
+                ui.vertical(|ui| {
+                    ui.label("📊 Totals");
+                    ui.label(format!("Messages: {}", self.bus_stats.total_messages()));
+                    if let Some(jitter) = self.bus_stats.jitter() {
+                        ui.label(format!("Jitter: ±{:.2} ms", jitter));
+                    } else {
+                        ui.label("Jitter: --");
+                    }
+                });
+            });
+        });
+    }
+    
+    fn show_stats_panel(&self, ui: &mut Ui) {
+        ui.vertical(|ui| {
+            ui.heading("📈 Detailed Stats");
+            ui.separator();
+            
+            // Top COB-IDs
+            ui.label("🏆 Most Frequent COB-IDs:");
+            ui.separator();
+            
+            let top_cobs = self.bus_stats.get_top_cob_ids(10);
+            if top_cobs.is_empty() {
+                ui.label("No data yet");
+            } else {
+                egui::Grid::new("top_cob_ids")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label("COB-ID");
+                        ui.label("Rate");
+                        ui.end_row();
+                        
+                        for (cob_id, rate) in top_cobs {
+                            ui.label(format!("0x{:03X}", cob_id));
+                            if rate >= 1.0 {
+                                ui.label(format!("{:.1} Hz", rate));
+                            } else {
+                                ui.label(format!("{:.2} Hz", rate));
+                            }
+                            ui.end_row();
+                        }
+                    });
+            }
+            
+            ui.separator();
+            
+            // Bus occupation details
+            ui.label("🔋 Bus Occupation Details:");
+            ui.separator();
+            ui.label(format!("• Current: {:.2}%", self.bus_stats.current_load()));
+            ui.label(format!("• Peak: {:.2}%", self.bus_stats.peak_load()));
+            ui.label(format!("• Average: {:.2}%", self.bus_stats.avg_load()));
+            
+            ui.separator();
+            
+            // Timing details
+            ui.label("⏱️ Timing Details:");
+            ui.separator();
+            if let Some(min_gap) = self.bus_stats.min_gap() {
+                ui.label(format!("• Min gap: {:.3} ms", min_gap));
+            }
+            if let Some(max_gap) = self.bus_stats.max_gap() {
+                ui.label(format!("• Max gap: {:.1} ms", max_gap));
+            }
+            if let Some(avg_gap) = self.bus_stats.avg_gap() {
+                ui.label(format!("• Avg gap: {:.3} ms", avg_gap));
+            }
+            if let Some(jitter) = self.bus_stats.jitter() {
+                ui.label(format!("• Jitter (σ): ±{:.3} ms", jitter));
+            }
+            
+            ui.separator();
+            
+            // Message rate details
+            ui.label("📬 Message Rate Details:");
+            ui.separator();
+            ui.label(format!("• Current: {:.1} msg/s", self.bus_stats.current_msg_rate()));
+            ui.label(format!("• Peak: {:.1} msg/s", self.bus_stats.peak_msg_rate()));
+            ui.label(format!("• Average: {:.2} msg/s", self.bus_stats.avg_msg_rate()));
+            ui.label(format!("• Total: {}", self.bus_stats.total_messages()));
+        });
     }
 
     fn show_connect_ui(&mut self, ui: &mut Ui) {
@@ -302,10 +461,30 @@ impl eframe::App for Gui {
                 });
             });
         
+        // Right side panel for detailed stats
+        egui::SidePanel::right("stats_panel")
+            .resizable(true)
+            .default_width(250.0)
+            .min_width(200.0)
+            .show(ctx, |ui| {
+                ui.add_enabled_ui(connected, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        self.show_stats_panel(ui);
+                    });
+                });
+            });
+        
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_enabled_ui(connected, |ui| {
+                // Dashboard at the top
+                self.show_dashboard(ui);
+                ui.separator();
+                
+                // Chart in the middle
                 self.chart.ui(ui);
                 ui.separator();
+                
+                // Filter panel
                 let to_pin = self.filter_panel.update(ui);
                 if self.stopped != self.filter_panel.stop {
                     self.stopped = self.filter_panel.stop;

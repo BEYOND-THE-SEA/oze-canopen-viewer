@@ -1,4 +1,5 @@
 pub mod bitrate;
+pub mod bus_stats;
 pub mod chart;
 pub mod driver;
 pub mod filter;
