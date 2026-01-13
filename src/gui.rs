@@ -16,13 +16,32 @@ use oze_canopen::{
     canopen::RxMessageToStringFormat,
     interface::{CanOpenInfo, Connection},
 };
-use std::{cell::RefCell, collections::VecDeque, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::VecDeque, io::Write, process::{Command, Stdio}, rc::Rc, sync::Arc};
 use tokio::{
     sync::{watch, mpsc, Mutex},
     time::Instant,
 };
 
 const MESSAGES_COUNT: usize = 4096;
+
+/// Standard CANopen bitrates
+const CANOPEN_BITRATES: &[(u32, &str)] = &[
+    (10_000, "10 kbit/s"),
+    (20_000, "20 kbit/s"),
+    (50_000, "50 kbit/s"),
+    (125_000, "125 kbit/s"),
+    (250_000, "250 kbit/s"),
+    (500_000, "500 kbit/s"),
+    (800_000, "800 kbit/s"),
+    (1_000_000, "1 Mbit/s"),
+];
+
+/// Action pending password confirmation
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingAction {
+    Connect,
+    Disconnect,
+}
 
 pub struct Gui {
     data: VecDeque<MessageCached>,
@@ -41,7 +60,7 @@ pub struct Gui {
     format: RxMessageToStringFormat,
 
     can_name_raw: String,
-    bitrate_raw: String,
+    selected_bitrate: Option<u32>,
 
     info: CanOpenInfo,
 
@@ -51,6 +70,15 @@ pub struct Gui {
     write_sender: mpsc::Sender<WriteCommand>,
     bitrate: Arc<Mutex<RatesData>>,
     last_seen_index: Option<u64>,
+
+    // Connection state
+    is_interface_up: bool,
+
+    // Password popup state
+    show_password_popup: bool,
+    password_input: String,
+    config_status: Option<Result<String, String>>,
+    pending_action: Option<PendingAction>,
 }
 
 impl Gui {
@@ -65,11 +93,16 @@ impl Gui {
 
         let global_filter = Rc::new(RefCell::new(GlobalFilter::default()));
         let connection_data = driver_ctrl.subscribe().borrow().connection.clone();
-        let can_name_raw = connection_data.can_name.clone();
-        let bitrate_raw = connection_data
-            .bitrate
-            .map(|b| b.to_string())
-            .unwrap_or_default();
+        
+        // Default to "can0" if no interface name is provided
+        let can_name_raw = if connection_data.can_name.is_empty() {
+            "can0".to_string()
+        } else {
+            connection_data.can_name.clone()
+        };
+        
+        // Default to 250 kbit/s if no bitrate is provided (most common CANopen bitrate)
+        let selected_bitrate = connection_data.bitrate.or(Some(250_000));
 
         Self {
             fps: VecDeque::new(),
@@ -88,12 +121,17 @@ impl Gui {
             stopped: false,
             global_filter,
             can_name_raw,
-            bitrate_raw,
+            selected_bitrate,
             driver_ctrl,
             driver,
             write_sender,
             bitrate,
             last_seen_index: None,
+            is_interface_up: false,
+            show_password_popup: false,
+            password_input: String::new(),
+            config_status: None,
+            pending_action: None,
         }
     }
 
@@ -337,31 +375,260 @@ impl Gui {
         });
     }
 
+    /// Run a command with sudo using password via stdin
+    fn run_sudo_command(password: &str, args: &[&str]) -> Result<(), String> {
+        let mut child = Command::new("sudo")
+            .arg("-S") // Read password from stdin
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn sudo: {}", e))?;
+
+        // Write password to stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            writeln!(stdin, "{}", password)
+                .map_err(|e| format!("Failed to write password: {}", e))?;
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| format!("Failed to wait for command: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Filter out the password prompt from error message
+            let filtered_error: String = stderr
+                .lines()
+                .filter(|line| !line.contains("[sudo]") && !line.contains("password"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !filtered_error.trim().is_empty() {
+                return Err(filtered_error);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Configure the CAN interface using ip link commands with password
+    fn configure_can_interface(can_name: &str, bitrate: Option<u32>, password: &str) -> Result<(), String> {
+        // First, bring the interface down (ignore errors if already down)
+        let _ = Self::run_sudo_command(password, &["ip", "link", "set", "down", can_name]);
+
+        // Set the CAN bitrate if provided
+        if let Some(br) = bitrate {
+            let bitrate_str = br.to_string();
+            Self::run_sudo_command(
+                password,
+                &["ip", "link", "set", can_name, "type", "can", "bitrate", &bitrate_str],
+            ).map_err(|e| format!("Failed to set bitrate: {}", e))?;
+            log::info!("CAN interface {} configured with bitrate {}", can_name, br);
+        }
+
+        // Bring the interface up
+        Self::run_sudo_command(password, &["ip", "link", "set", "up", can_name])
+            .map_err(|e| format!("Failed to bring interface up: {}", e))?;
+
+        log::info!("CAN interface {} is now up", can_name);
+        Ok(())
+    }
+
     fn show_connect_ui(&mut self, ui: &mut Ui) {
-        ui.add(
+        // Disable interface name and bitrate when connected
+        ui.add_enabled(
+            !self.is_interface_up,
             TextEdit::singleline(&mut self.can_name_raw)
                 .hint_text("can name")
-                .desired_width(100.0),
+                .desired_width(80.0),
         );
 
-        ui.add(
-            TextEdit::singleline(&mut self.bitrate_raw)
-                .hint_text("bitrate")
-                .desired_width(100.0),
-        );
-        let bitrate = self.bitrate_raw.parse::<u32>().ok();
-        let button_enbled = !self.can_name_raw.is_empty()
-            && ((bitrate.is_some()
-                && bitrate.unwrap_or_default() <= 1_000_000
-                && bitrate.unwrap_or_default() > 0)
-                || self.bitrate_raw.is_empty());
-        if ui
-            .add_enabled(button_enbled, Button::new("🔌Connect"))
-            .clicked()
-        {
-            self.connection.can_name = self.can_name_raw.clone();
-            self.connection.bitrate = bitrate;
-            self.send_driver_control();
+        // Bitrate dropdown (disabled when connected)
+        let current_label = self.selected_bitrate
+            .and_then(|br| CANOPEN_BITRATES.iter().find(|(val, _)| *val == br))
+            .map(|(_, label)| *label)
+            .unwrap_or("Select bitrate");
+        
+        ui.add_enabled_ui(!self.is_interface_up, |ui| {
+            egui::ComboBox::from_id_salt("bitrate_selector")
+                .selected_text(current_label)
+                .width(100.0)
+                .show_ui(ui, |ui| {
+                    for (value, label) in CANOPEN_BITRATES {
+                        let is_selected = self.selected_bitrate == Some(*value);
+                        if ui.selectable_label(is_selected, *label).clicked() {
+                            self.selected_bitrate = Some(*value);
+                        }
+                    }
+                });
+        });
+
+        if self.is_interface_up {
+            // Disconnect button
+            if ui.button("🔌 Disconnect").clicked() {
+                self.show_password_popup = true;
+                self.password_input.clear();
+                self.config_status = None;
+                self.pending_action = Some(PendingAction::Disconnect);
+            }
+        } else {
+            // Connect button
+            let button_enabled = !self.can_name_raw.is_empty() && self.selected_bitrate.is_some();
+            if ui
+                .add_enabled(button_enabled, Button::new("🔌 Connect"))
+                .clicked()
+            {
+                self.show_password_popup = true;
+                self.password_input.clear();
+                self.config_status = None;
+                self.pending_action = Some(PendingAction::Connect);
+            }
+        }
+    }
+
+    fn show_password_popup(&mut self, ctx: &egui::Context) {
+        if !self.show_password_popup {
+            return;
+        }
+
+        let is_disconnect = self.pending_action == Some(PendingAction::Disconnect);
+        let title = if is_disconnect {
+            "🔐 Disconnect Interface"
+        } else {
+            "🔐 Connect Interface"
+        };
+        let description = if is_disconnect {
+            "Enter sudo password to bring down CAN interface:"
+        } else {
+            "Enter sudo password to configure CAN interface:"
+        };
+        let action_label = if is_disconnect { "✅ Disconnect" } else { "✅ Connect" };
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(description);
+                    ui.add_space(10.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label("Password:");
+                        let response = ui.add(
+                            TextEdit::singleline(&mut self.password_input)
+                                .password(true)
+                                .desired_width(200.0),
+                        );
+                        
+                        // Focus the password field when popup opens
+                        if self.config_status.is_none() {
+                            response.request_focus();
+                        }
+
+                        // Submit on Enter key
+                        if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            self.execute_pending_action();
+                        }
+                    });
+
+                    ui.add_space(10.0);
+
+                    // Show status message if any
+                    if let Some(ref status) = self.config_status {
+                        match status {
+                            Ok(msg) => {
+                                ui.colored_label(egui::Color32::GREEN, msg);
+                            }
+                            Err(msg) => {
+                                ui.colored_label(egui::Color32::RED, format!("❌ {}", msg));
+                            }
+                        }
+                        ui.add_space(5.0);
+                    }
+
+                    ui.horizontal(|ui| {
+                        if ui.button(action_label).clicked() {
+                            self.execute_pending_action();
+                        }
+
+                        if ui.button("❌ Cancel").clicked() {
+                            self.show_password_popup = false;
+                            self.password_input.clear();
+                            self.config_status = None;
+                            self.pending_action = None;
+                        }
+                    });
+                });
+            });
+    }
+
+    fn execute_pending_action(&mut self) {
+        match self.pending_action {
+            Some(PendingAction::Connect) => {
+                self.try_configure_and_connect();
+            }
+            Some(PendingAction::Disconnect) => {
+                self.try_disconnect();
+            }
+            None => {}
+        }
+    }
+
+    fn try_disconnect(&mut self) {
+        match Self::disconnect_interface(&self.can_name_raw, &self.password_input) {
+            Ok(()) => {
+                log::info!("CAN interface disconnected successfully");
+                self.is_interface_up = false;
+                
+                // Close popup and clear password
+                self.show_password_popup = false;
+                self.password_input.clear();
+                self.config_status = None;
+                self.pending_action = None;
+            }
+            Err(e) => {
+                log::error!("Failed to disconnect CAN interface: {}", e);
+                self.config_status = Some(Err(e));
+            }
+        }
+    }
+
+    /// Bring down the CAN interface
+    fn disconnect_interface(can_name: &str, password: &str) -> Result<(), String> {
+        Self::run_sudo_command(password, &["ip", "link", "set", "down", can_name])
+            .map_err(|e| format!("Failed to bring interface down: {}", e))?;
+
+        log::info!("CAN interface {} is now down", can_name);
+        Ok(())
+    }
+
+    fn try_configure_and_connect(&mut self) {
+        let bitrate = self.selected_bitrate;
+        
+        // Configure the CAN interface with the provided password
+        match Self::configure_can_interface(&self.can_name_raw, bitrate, &self.password_input) {
+            Ok(()) => {
+                log::info!("CAN interface configured successfully, connecting...");
+                self.is_interface_up = true;
+                
+                // Connect after successful configuration
+                self.connection.can_name = self.can_name_raw.clone();
+                self.connection.bitrate = bitrate;
+                self.send_driver_control();
+                
+                // Close the popup and clear password
+                self.show_password_popup = false;
+                self.password_input.clear();
+                self.config_status = None;
+                self.pending_action = None;
+            }
+            Err(e) => {
+                log::error!("Failed to configure CAN interface: {}", e);
+                self.config_status = Some(Err(e));
+                // Don't clear password so user can retry
+            }
         }
     }
 
@@ -412,6 +679,9 @@ impl eframe::App for Gui {
             ctx.request_repaint();
             return;
         }
+
+        // Show password popup if needed
+        self.show_password_popup(ctx);
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
