@@ -19,7 +19,21 @@ sudo apt-get install mingw-w64
 
 ## Modification de oze-canopen
 
-Vous devez modifier votre fork de `oze-canopen` pour utiliser `host-can` au lieu de `socketcan`.
+**Vous avez 2 options** :
+
+### Option A : Fork GitHub (recommandé - pas de clone local)
+
+1. Forker `oze-canopen` sur GitHub (si pas déjà fait)
+2. Modifier le fork sur GitHub pour utiliser `host-can`
+3. Utiliser un patch Git dans `Cargo.toml` (voir ci-dessous)
+
+### Option B : Clone local
+
+1. Cloner `oze-canopen` localement
+2. Le modifier pour utiliser `host-can`
+3. Utiliser un patch path dans `Cargo.toml`
+
+### Modifications nécessaires dans oze-canopen
 
 ### 1. Modifier Cargo.toml de oze-canopen
 
@@ -60,7 +74,14 @@ let adapter = Adapter::new("can0")?;  // Sur Windows: "PCAN_USBBUS1"
 
 ### Configuration initiale (une seule fois)
 
-Si vous utilisez un fork local de `oze-canopen`, décommenter dans `Cargo.toml` :
+**Option A - Fork GitHub** (recommandé) :
+
+```toml
+[patch.crates-io]
+oze-canopen = { git = "https://github.com/<votre-username>/oze-canopen", branch = "host-can" }
+```
+
+**Option B - Clone local** :
 
 ```toml
 [patch.crates-io]
