@@ -11,6 +11,10 @@ pub struct PinnedFilters {
 }
 
 impl PinnedFilters {
+    pub fn clear(&mut self) {
+        self.data.clear();
+    }
+
     pub fn pin_filter(&mut self, mut filt: FilterDataPanel, data: &VecDeque<MessageCached>) {
         let data_filter = filt.data_filter.borrow().clone();
         let new_data = data.iter().find(|i| !data_filter.filter(i));

@@ -9,6 +9,7 @@ pub struct FilterPanel {
     pub global_filter: Rc<RefCell<GlobalFilter>>,
     pub data_panel: FilterDataPanel,
     pub stop: bool,
+    pub clear_requested: bool,
 }
 
 impl FilterPanel {
@@ -18,6 +19,7 @@ impl FilterPanel {
             data_panel,
             global_filter,
             stop: false,
+            clear_requested: false,
         }
     }
 
@@ -30,6 +32,10 @@ impl FilterPanel {
             {
                 self.stop = !self.stop;
                 changed = true;
+            }
+
+            if ui.button("CLEAR").clicked() {
+                self.clear_requested = true;
             }
 
             if ui.button("ALL").clicked() {

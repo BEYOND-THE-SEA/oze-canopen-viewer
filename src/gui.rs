@@ -50,6 +50,7 @@ pub struct Gui {
     driver_ctrl: watch::Sender<Control>,
     write_sender: mpsc::Sender<WriteCommand>,
     bitrate: Arc<Mutex<RatesData>>,
+    last_seen_index: Option<u64>,
 }
 
 impl Gui {
@@ -92,6 +93,7 @@ impl Gui {
             driver,
             write_sender,
             bitrate,
+            last_seen_index: None,
         }
     }
 
@@ -111,11 +113,15 @@ impl Gui {
         let now = Instant::now();
         
         for i in &driver.data {
-            if let Some(last) = self.data.front() {
-                if i.index <= last.index {
+            // Use last_seen_index to filter already processed messages
+            if let Some(last_index) = self.last_seen_index {
+                if i.index <= last_index {
                     continue;
                 }
             }
+
+            // Update last seen index
+            self.last_seen_index = Some(i.index);
 
             // Update bus statistics
             self.bus_stats.on_message(i.msg.msg.cob_id, now);
@@ -489,6 +495,13 @@ impl eframe::App for Gui {
                 if self.stopped != self.filter_panel.stop {
                     self.stopped = self.filter_panel.stop;
                     self.send_driver_control();
+                }
+                if self.filter_panel.clear_requested {
+                    self.filter_panel.clear_requested = false;
+                    self.data.clear();
+                    self.bus_stats.reset();
+                    self.bus_load_history.clear();
+                    self.pinned_filters.clear();
                 }
                 if let Some(to_pin) = to_pin {
                     self.pinned_filters.pin_filter(to_pin, &self.data);

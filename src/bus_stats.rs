@@ -67,6 +67,11 @@ impl BusStats {
         }
     }
     
+    /// Reset all statistics
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+    
     /// Update statistics with a new message
     pub fn on_message(&mut self, cob_id: u16, timestamp: Instant) {
         self.total_messages += 1;
