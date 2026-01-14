@@ -50,7 +50,7 @@ panic = { level = "warn" }
 # Remplacez <votre-username> et <votre-branche> par vos valeurs
 [patch.crates-io]
 # Votre fork GitHub de oze-canopen (décommentez après avoir fait les modifications)
-oze-canopen = { git = "https://github.com/BEYOND-THE-SEA/oze-canopen", branch = "main" }
+oze-canopen = { git = "https://github.com/BEYOND-THE-SEA/oze-canopen", branch = "windows" }
 
 [package.metadata.deb]
 depends = ["can-utils", "libcap2-bin"]
