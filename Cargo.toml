@@ -39,9 +39,11 @@ unwrap_used = { level = "allow" }
 panic = { level = "warn" }
 
 [package.metadata.deb]
-depends = ["can-utils", "libcap2-bin"]
+depends = ["can-utils", "libcap2-bin", "sshpass"]
 maintainer-scripts = "deb/maintainer-scripts"
 assets = [
     # binary
     ["target/release/oze-canopen-viewer", "usr/bin/", "755"],
+    # cannelloni for remote CAN connections
+    ["bin/cannelloni", "usr/bin/", "755"],
 ]

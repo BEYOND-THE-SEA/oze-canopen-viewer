@@ -8,6 +8,7 @@ use crate::{
     message_cached::MessageCached,
     message_sender::MessageSender,
     pinned_filter::PinnedFilters,
+    remote_connection::{LocalCannelloniClient, RemoteConnection, RemoteSetupStatus, DEFAULT_CANNELLONI_PORT},
     theme::{theme, OZON_GRAY, OZON_PINK},
     viewer::Viewer,
 };
@@ -36,7 +37,15 @@ const CANOPEN_BITRATES: &[(u32, &str)] = &[
     (1_000_000, "1 Mbit/s"),
 ];
 
-/// Action pending password confirmation
+/// Connection mode: local CAN interface or remote via SSH
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConnectionMode {
+    #[default]
+    Local,
+    Remote,
+}
+
+/// Action pending password confirmation (for local connections only)
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PendingAction {
     Connect,
@@ -79,6 +88,15 @@ pub struct Gui {
     password_input: String,
     config_status: Option<Result<String, String>>,
     pending_action: Option<PendingAction>,
+
+    // Remote connection state
+    connection_mode: ConnectionMode,
+    remote_ssh_host: String,
+    remote_ssh_user: String,
+    remote_ssh_password: String,
+    remote_can_interface: String,
+    remote_setup_status: RemoteSetupStatus,
+    is_remote_connected: bool,
 }
 
 impl Gui {
@@ -132,6 +150,14 @@ impl Gui {
             password_input: String::new(),
             config_status: None,
             pending_action: None,
+            // Remote connection state
+            connection_mode: ConnectionMode::Local,
+            remote_ssh_host: String::new(),
+            remote_ssh_user: String::new(),
+            remote_ssh_password: String::new(),
+            remote_can_interface: "can0".to_string(),
+            remote_setup_status: RemoteSetupStatus::Idle,
+            is_remote_connected: false,
         }
     }
 
@@ -436,6 +462,35 @@ impl Gui {
     }
 
     fn show_connect_ui(&mut self, ui: &mut Ui) {
+        let is_connected = self.is_interface_up || self.is_remote_connected;
+        
+        // Connection mode selector (disabled when connected)
+        ui.add_enabled_ui(!is_connected, |ui| {
+            egui::ComboBox::from_id_salt("connection_mode")
+                .selected_text(match self.connection_mode {
+                    ConnectionMode::Local => "🖥️ Local",
+                    ConnectionMode::Remote => "🌐 Remote",
+                })
+                .width(90.0)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(self.connection_mode == ConnectionMode::Local, "🖥️ Local").clicked() {
+                        self.connection_mode = ConnectionMode::Local;
+                    }
+                    if ui.selectable_label(self.connection_mode == ConnectionMode::Remote, "🌐 Remote").clicked() {
+                        self.connection_mode = ConnectionMode::Remote;
+                    }
+                });
+        });
+
+        ui.separator();
+
+        match self.connection_mode {
+            ConnectionMode::Local => self.show_local_connect_ui(ui),
+            ConnectionMode::Remote => self.show_remote_connect_ui(ui),
+        }
+    }
+
+    fn show_local_connect_ui(&mut self, ui: &mut Ui) {
         // Disable interface name and bitrate when connected
         ui.add_enabled(
             !self.is_interface_up,
@@ -487,23 +542,125 @@ impl Gui {
         }
     }
 
+    fn show_remote_connect_ui(&mut self, ui: &mut Ui) {
+        let is_connecting = matches!(
+            self.remote_setup_status,
+            RemoteSetupStatus::TestingConnection
+                | RemoteSetupStatus::CheckingCannelloni
+                | RemoteSetupStatus::DeployingCannelloni
+                | RemoteSetupStatus::ConfiguringCanInterface
+                | RemoteSetupStatus::StartingServer
+                | RemoteSetupStatus::CreatingVcan
+                | RemoteSetupStatus::StartingClient
+        );
+
+        // SSH Host
+        ui.add_enabled(
+            !self.is_remote_connected && !is_connecting,
+            TextEdit::singleline(&mut self.remote_ssh_host)
+                .hint_text("Host (IP ou nom)")
+                .desired_width(160.0),
+        ).on_hover_text("IP address or hostname of the remote machine (e.g., 192.168.0.166 or pc-bts3.local)");
+
+        // SSH User
+        ui.add_enabled(
+            !self.is_remote_connected && !is_connecting,
+            TextEdit::singleline(&mut self.remote_ssh_user)
+                .hint_text("User")
+                .desired_width(100.0),
+        ).on_hover_text("SSH username");
+
+        // SSH Password
+        ui.add_enabled(
+            !self.is_remote_connected && !is_connecting,
+            TextEdit::singleline(&mut self.remote_ssh_password)
+                .hint_text("Password")
+                .password(true)
+                .desired_width(120.0),
+        ).on_hover_text("SSH password (also used for sudo on remote)");
+
+        // Remote CAN interface
+        ui.add_enabled(
+            !self.is_remote_connected && !is_connecting,
+            TextEdit::singleline(&mut self.remote_can_interface)
+                .hint_text("can0")
+                .desired_width(60.0),
+        ).on_hover_text("CAN interface on the remote machine (e.g., can0)");
+
+        // Bitrate dropdown
+        let current_label = self.selected_bitrate
+            .and_then(|br| CANOPEN_BITRATES.iter().find(|(val, _)| *val == br))
+            .map(|(_, label)| *label)
+            .unwrap_or("Bitrate");
+        
+        ui.add_enabled_ui(!self.is_remote_connected && !is_connecting, |ui| {
+            egui::ComboBox::from_id_salt("remote_bitrate_selector")
+                .selected_text(current_label)
+                .width(100.0)
+                .show_ui(ui, |ui| {
+                    for (value, label) in CANOPEN_BITRATES {
+                        let is_selected = self.selected_bitrate == Some(*value);
+                        if ui.selectable_label(is_selected, *label).clicked() {
+                            self.selected_bitrate = Some(*value);
+                        }
+                    }
+                });
+        });
+
+        // Connect/Disconnect button
+        if self.is_remote_connected {
+            if ui.button("🔌 Disconnect").clicked() {
+                self.try_remote_disconnect();
+            }
+        } else if is_connecting {
+            ui.add_enabled(false, Button::new("⏳ Connecting..."));
+        } else {
+            let button_enabled = !self.remote_ssh_host.is_empty()
+                && !self.remote_ssh_user.is_empty()
+                && !self.remote_ssh_password.is_empty()
+                && !self.remote_can_interface.is_empty()
+                && self.selected_bitrate.is_some();
+            
+            if ui.add_enabled(button_enabled, Button::new("🔌 Connect")).clicked() {
+                // Connect directly without popup
+                self.try_remote_connect();
+            }
+        }
+
+        // Show status
+        if !matches!(self.remote_setup_status, RemoteSetupStatus::Idle | RemoteSetupStatus::Connected) {
+            ui.separator();
+            match &self.remote_setup_status {
+                RemoteSetupStatus::Failed(msg) => {
+                    ui.colored_label(egui::Color32::RED, format!("❌ {}", msg));
+                }
+                status => {
+                    ui.colored_label(egui::Color32::YELLOW, format!("⏳ {}", status));
+                }
+            }
+        }
+    }
+
     fn show_password_popup(&mut self, ctx: &egui::Context) {
         if !self.show_password_popup {
             return;
         }
 
-        let is_disconnect = self.pending_action == Some(PendingAction::Disconnect);
-        let title = if is_disconnect {
-            "🔐 Disconnect Interface"
-        } else {
-            "🔐 Connect Interface"
+        let (title, description, action_label, password_hint) = match self.pending_action {
+            Some(PendingAction::Connect) => (
+                "🔐 Connect Interface",
+                "Enter sudo password to configure CAN interface:",
+                "✅ Connect",
+                "Sudo password",
+            ),
+            Some(PendingAction::Disconnect) => (
+                "🔐 Disconnect Interface",
+                "Enter sudo password to bring down CAN interface:",
+                "✅ Disconnect",
+                "Sudo password",
+            ),
+            None => return,
         };
-        let description = if is_disconnect {
-            "Enter sudo password to bring down CAN interface:"
-        } else {
-            "Enter sudo password to configure CAN interface:"
-        };
-        let action_label = if is_disconnect { "✅ Disconnect" } else { "✅ Connect" };
 
         egui::Window::new(title)
             .collapsible(false)
@@ -514,24 +671,27 @@ impl Gui {
                     ui.label(description);
                     ui.add_space(10.0);
 
-                    ui.horizontal(|ui| {
-                        ui.label("Password:");
-                        let response = ui.add(
-                            TextEdit::singleline(&mut self.password_input)
-                                .password(true)
-                                .desired_width(200.0),
-                        );
-                        
-                        // Focus the password field when popup opens
-                        if self.config_status.is_none() {
-                            response.request_focus();
-                        }
+                    // Only show password field if needed
+                    if !password_hint.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{}:", password_hint));
+                            let response = ui.add(
+                                TextEdit::singleline(&mut self.password_input)
+                                    .password(true)
+                                    .desired_width(200.0),
+                            );
+                            
+                            // Focus the password field when popup opens
+                            if self.config_status.is_none() {
+                                response.request_focus();
+                            }
 
-                        // Submit on Enter key
-                        if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            self.execute_pending_action();
-                        }
-                    });
+                            // Submit on Enter key
+                            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                self.execute_pending_action();
+                            }
+                        });
+                    }
 
                     ui.add_space(10.0);
 
@@ -630,6 +790,125 @@ impl Gui {
                 // Don't clear password so user can retry
             }
         }
+    }
+
+    fn try_remote_connect(&mut self) {
+        // Start the remote connection process
+        self.remote_setup_status = RemoteSetupStatus::TestingConnection;
+        
+        // Clone values for the async task
+        let ssh_host = self.remote_ssh_host.clone();
+        let ssh_user = self.remote_ssh_user.clone();
+        let ssh_password = self.remote_ssh_password.clone();
+        let can_interface = self.remote_can_interface.clone();
+        let bitrate = self.selected_bitrate;
+        let port = DEFAULT_CANNELLONI_PORT;
+        
+        // Spawn the async setup task
+        let rt = tokio::runtime::Handle::current();
+        let result = rt.block_on(async {
+            Self::setup_remote_connection_async(
+                ssh_host.clone(),
+                ssh_user,
+                ssh_password,
+                can_interface,
+                bitrate,
+                port,
+            ).await
+        });
+        
+        match result {
+            Ok(()) => {
+                log::info!("Remote connection established successfully");
+                self.remote_setup_status = RemoteSetupStatus::Connected;
+                self.is_remote_connected = true;
+                
+                // Connect the viewer to vcan0
+                self.connection.can_name = "vcan0".to_string();
+                self.connection.bitrate = None; // vcan0 doesn't need bitrate
+                self.send_driver_control();
+            }
+            Err(e) => {
+                log::error!("Remote connection failed: {}", e);
+                self.remote_setup_status = RemoteSetupStatus::Failed(e);
+                self.is_remote_connected = false;
+            }
+        }
+        // Note: Don't clear SSH password so user can retry connection if needed
+    }
+
+    async fn setup_remote_connection_async(
+        ssh_host: String,
+        ssh_user: String,
+        ssh_password: String,
+        can_interface: String,
+        bitrate: Option<u32>,
+        port: u16,
+    ) -> Result<(), String> {
+        // Create remote connection handler
+        let remote = RemoteConnection::new(
+            ssh_host.clone(),
+            ssh_user,
+            ssh_password,
+            can_interface,
+            bitrate,
+            port,
+        );
+
+        // Step 1: Test SSH connection
+        log::info!("Step 1/6: Testing SSH connection...");
+        remote.test_connection().await
+            .map_err(|e| format!("Step 1 - SSH connection failed: {}", e))?;
+
+        // Step 2: Check/install cannelloni
+        log::info!("Step 2/6: Checking cannelloni on remote...");
+        if !remote.check_cannelloni_installed().await
+            .map_err(|e| format!("Step 2 - Failed to check cannelloni: {}", e))? 
+        {
+            log::info!("Step 2b/6: Deploying cannelloni to remote...");
+            remote.deploy_cannelloni().await
+                .map_err(|e| format!("Step 2 - Failed to deploy cannelloni: {}", e))?;
+        }
+
+        // Step 3: Configure CAN interface
+        log::info!("Step 3/6: Configuring CAN interface on remote...");
+        remote.setup_can_interface().await
+            .map_err(|e| format!("Step 3 - CAN interface config failed: {}", e))?;
+
+        // Step 4: Start cannelloni server
+        log::info!("Step 4/6: Starting cannelloni server on remote...");
+        remote.start_cannelloni_server().await
+            .map_err(|e| format!("Step 4 - Cannelloni server failed: {}", e))?;
+
+        // Step 5: Create local vcan0
+        log::info!("Step 5/6: Creating local vcan0 interface...");
+        LocalCannelloniClient::create_vcan_interface().await
+            .map_err(|e| format!("Step 5 - Failed to create vcan0: {}", e))?;
+
+        // Step 6: Start cannelloni client
+        log::info!("Step 6/6: Starting cannelloni client...");
+        LocalCannelloniClient::start_client(&ssh_host, port).await
+            .map_err(|e| format!("Step 6 - Cannelloni client failed: {}", e))?;
+
+        Ok(())
+    }
+
+    fn try_remote_disconnect(&mut self) {
+        log::info!("Disconnecting remote connection");
+        
+        // Stop local cannelloni client
+        let rt = tokio::runtime::Handle::current();
+        let _ = rt.block_on(async {
+            LocalCannelloniClient::cleanup(false).await
+        });
+        
+        // Reset state
+        self.is_remote_connected = false;
+        self.remote_setup_status = RemoteSetupStatus::Idle;
+        
+        // Note: Don't clear password so user can reconnect easily
+        
+        log::info!("Remote connection disconnected");
     }
 
     fn show_format_ui(&mut self, ui: &mut Ui) {
