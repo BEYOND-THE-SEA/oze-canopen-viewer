@@ -17,7 +17,7 @@ use oze_canopen::{
     canopen::RxMessageToStringFormat,
     interface::{CanOpenInfo, Connection},
 };
-use std::{cell::RefCell, collections::VecDeque, io::Write, process::{Command, Stdio}, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::VecDeque, io::Write, process::{Command, Stdio}, rc::Rc, sync::Arc, sync::mpsc as std_mpsc};
 use tokio::{
     sync::{watch, mpsc, Mutex},
     time::Instant,
@@ -97,6 +97,10 @@ pub struct Gui {
     remote_can_interface: String,
     remote_setup_status: RemoteSetupStatus,
     is_remote_connected: bool,
+    remote_status_receiver: Option<std_mpsc::Receiver<RemoteSetupStatus>>,
+    
+    // UI toggles
+    show_stats_panel: bool,
 }
 
 impl Gui {
@@ -158,6 +162,9 @@ impl Gui {
             remote_can_interface: "can0".to_string(),
             remote_setup_status: RemoteSetupStatus::Idle,
             is_remote_connected: false,
+            remote_status_receiver: None,
+            // UI toggles
+            show_stats_panel: false,
         }
     }
 
@@ -222,6 +229,11 @@ impl Gui {
     fn calc_bus_load(&mut self) -> Option<f64> {
         use tokio::runtime::Handle;
         
+        // Always update message rate and COB-ID rates (independent of bitrate)
+        self.bus_stats.calculate_msg_rate();
+        self.bus_stats.calculate_cob_id_rates(Instant::now());
+        
+        // Bus load calculation requires configured bitrate
         if let Some(configured_bitrate) = self.connection.bitrate {
             let rates = Handle::current().block_on(async {
                 self.bitrate.lock().await.clone()
@@ -244,10 +256,8 @@ impl Gui {
                 if !self.bus_load_history.is_empty() {
                     let avg = self.bus_load_history.iter().sum::<f64>() / self.bus_load_history.len() as f64;
                     
-                    // Update bus statistics
+                    // Update bus statistics with load
                     self.bus_stats.update_load(avg);
-                    self.bus_stats.calculate_msg_rate();
-                    self.bus_stats.calculate_cob_id_rates(Instant::now());
                     
                     return Some(avg);
                 }
@@ -256,84 +266,9 @@ impl Gui {
         None
     }
     
-    fn show_dashboard(&self, ui: &mut Ui) {
-        use egui::Color32;
-        
-        ui.group(|ui| {
-            ui.heading("📊 Bus Statistics");
-            ui.separator();
-            
-            ui.horizontal(|ui| {
-                // Occupation section
-                ui.vertical(|ui| {
-                    ui.label("🔋 Bus Occupation");
-                    ui.horizontal(|ui| {
-                        ui.label("Current:");
-                        let color = if self.bus_stats.current_load() > 80.0 {
-                            Color32::RED
-                        } else if self.bus_stats.current_load() > 50.0 {
-                            Color32::YELLOW
-                        } else {
-                            Color32::GREEN
-                        };
-                        ui.colored_label(color, format!("{:.1}%", self.bus_stats.current_load()));
-                    });
-                    ui.label(format!("Peak: {:.1}%", self.bus_stats.peak_load()));
-                    ui.label(format!("Average: {:.1}%", self.bus_stats.avg_load()));
-                });
-                
-                ui.separator();
-                
-                // Message rate section
-                ui.vertical(|ui| {
-                    ui.label("📬 Message Rate");
-                    ui.label(format!("Current: {:.0} msg/s", self.bus_stats.current_msg_rate()));
-                    ui.label(format!("Peak: {:.0} msg/s", self.bus_stats.peak_msg_rate()));
-                    ui.label(format!("Average: {:.1} msg/s", self.bus_stats.avg_msg_rate()));
-                });
-                
-                ui.separator();
-                
-                // Timing analysis section
-                ui.vertical(|ui| {
-                    ui.label("⏱️ Inter-Frame Timing");
-                    if let Some(min_gap) = self.bus_stats.min_gap() {
-                        ui.label(format!("Min: {:.2} ms", min_gap));
-                    } else {
-                        ui.label("Min: --");
-                    }
-                    if let Some(max_gap) = self.bus_stats.max_gap() {
-                        ui.label(format!("Max: {:.1} ms", max_gap));
-                    } else {
-                        ui.label("Max: --");
-                    }
-                    if let Some(avg_gap) = self.bus_stats.avg_gap() {
-                        ui.label(format!("Avg: {:.2} ms", avg_gap));
-                    } else {
-                        ui.label("Avg: --");
-                    }
-                });
-                
-                ui.separator();
-                
-                // Total messages
-                ui.vertical(|ui| {
-                    ui.label("📊 Totals");
-                    ui.label(format!("Messages: {}", self.bus_stats.total_messages()));
-                    if let Some(jitter) = self.bus_stats.jitter() {
-                        ui.label(format!("Jitter: ±{:.2} ms", jitter));
-                    } else {
-                        ui.label("Jitter: --");
-                    }
-                });
-            });
-        });
-    }
     
-    fn show_stats_panel(&self, ui: &mut Ui) {
+    fn show_stats_content(&self, ui: &mut Ui) {
         ui.vertical(|ui| {
-            ui.heading("📈 Detailed Stats");
-            ui.separator();
             
             // Top COB-IDs
             ui.label("🏆 Most Frequent COB-IDs:");
@@ -793,6 +728,10 @@ impl Gui {
     }
 
     fn try_remote_connect(&mut self) {
+        // Create a channel for status updates
+        let (tx, rx) = std_mpsc::channel();
+        self.remote_status_receiver = Some(rx);
+        
         // Start the remote connection process
         self.remote_setup_status = RemoteSetupStatus::TestingConnection;
         
@@ -804,46 +743,83 @@ impl Gui {
         let bitrate = self.selected_bitrate;
         let port = DEFAULT_CANNELLONI_PORT;
         
-        // Spawn the async setup task
-        let rt = tokio::runtime::Handle::current();
-        let result = rt.block_on(async {
-            Self::setup_remote_connection_async(
-                ssh_host.clone(),
+        // Spawn the async setup task (non-blocking)
+        tokio::spawn(async move {
+            let result = Self::setup_remote_connection_async_with_status(
+                ssh_host,
                 ssh_user,
                 ssh_password,
                 can_interface,
                 bitrate,
                 port,
-            ).await
+                tx.clone(),
+            ).await;
+            
+            // Send final status
+            match result {
+                Ok(()) => {
+                    let _ = tx.send(RemoteSetupStatus::Connected);
+                }
+                Err(e) => {
+                    let _ = tx.send(RemoteSetupStatus::Failed(e));
+                }
+            }
         });
-        
-        match result {
-            Ok(()) => {
-                log::info!("Remote connection established successfully");
-                self.remote_setup_status = RemoteSetupStatus::Connected;
-                self.is_remote_connected = true;
-                
-                // Connect the viewer to vcan0
-                self.connection.can_name = "vcan0".to_string();
-                self.connection.bitrate = None; // vcan0 doesn't need bitrate
-                self.send_driver_control();
-            }
-            Err(e) => {
-                log::error!("Remote connection failed: {}", e);
-                self.remote_setup_status = RemoteSetupStatus::Failed(e);
-                self.is_remote_connected = false;
-            }
-        }
         // Note: Don't clear SSH password so user can retry connection if needed
     }
+    
+    /// Poll the remote connection status channel and update state
+    fn poll_remote_connection_status(&mut self) {
+        // Collect status updates first (to avoid borrow issues)
+        let mut updates = Vec::new();
+        let mut should_clear_receiver = false;
+        
+        if let Some(ref rx) = self.remote_status_receiver {
+            while let Ok(status) = rx.try_recv() {
+                let is_final = matches!(&status, RemoteSetupStatus::Connected | RemoteSetupStatus::Failed(_));
+                if is_final {
+                    should_clear_receiver = true;
+                }
+                updates.push(status);
+            }
+        }
+        
+        // Process updates
+        for status in updates {
+            log::info!("Remote connection status: {:?}", status);
+            
+            match &status {
+                RemoteSetupStatus::Connected => {
+                    self.is_remote_connected = true;
+                    
+                    // Connect the viewer to vcan0
+                    self.connection.can_name = "vcan0".to_string();
+                    self.connection.bitrate = None; // vcan0 doesn't need bitrate
+                    self.send_driver_control();
+                }
+                RemoteSetupStatus::Failed(_) => {
+                    self.is_remote_connected = false;
+                }
+                _ => {}
+            }
+            
+            self.remote_setup_status = status;
+        }
+        
+        // Clear receiver if we got a final status
+        if should_clear_receiver {
+            self.remote_status_receiver = None;
+        }
+    }
 
-    async fn setup_remote_connection_async(
+    async fn setup_remote_connection_async_with_status(
         ssh_host: String,
         ssh_user: String,
         ssh_password: String,
         can_interface: String,
         bitrate: Option<u32>,
         port: u16,
+        status_tx: std_mpsc::Sender<RemoteSetupStatus>,
     ) -> Result<(), String> {
         // Create remote connection handler
         let remote = RemoteConnection::new(
@@ -857,36 +833,43 @@ impl Gui {
 
         // Step 1: Test SSH connection
         log::info!("Step 1/6: Testing SSH connection...");
+        let _ = status_tx.send(RemoteSetupStatus::TestingConnection);
         remote.test_connection().await
             .map_err(|e| format!("Step 1 - SSH connection failed: {}", e))?;
 
         // Step 2: Check/install cannelloni
         log::info!("Step 2/6: Checking cannelloni on remote...");
+        let _ = status_tx.send(RemoteSetupStatus::CheckingCannelloni);
         if !remote.check_cannelloni_installed().await
             .map_err(|e| format!("Step 2 - Failed to check cannelloni: {}", e))? 
         {
             log::info!("Step 2b/6: Deploying cannelloni to remote...");
+            let _ = status_tx.send(RemoteSetupStatus::DeployingCannelloni);
             remote.deploy_cannelloni().await
                 .map_err(|e| format!("Step 2 - Failed to deploy cannelloni: {}", e))?;
         }
 
         // Step 3: Configure CAN interface
         log::info!("Step 3/6: Configuring CAN interface on remote...");
+        let _ = status_tx.send(RemoteSetupStatus::ConfiguringCanInterface);
         remote.setup_can_interface().await
             .map_err(|e| format!("Step 3 - CAN interface config failed: {}", e))?;
 
         // Step 4: Start cannelloni server
         log::info!("Step 4/6: Starting cannelloni server on remote...");
+        let _ = status_tx.send(RemoteSetupStatus::StartingServer);
         remote.start_cannelloni_server().await
             .map_err(|e| format!("Step 4 - Cannelloni server failed: {}", e))?;
 
         // Step 5: Create local vcan0
         log::info!("Step 5/6: Creating local vcan0 interface...");
+        let _ = status_tx.send(RemoteSetupStatus::CreatingVcan);
         LocalCannelloniClient::create_vcan_interface().await
             .map_err(|e| format!("Step 5 - Failed to create vcan0: {}", e))?;
 
         // Step 6: Start cannelloni client
         log::info!("Step 6/6: Starting cannelloni client...");
+        let _ = status_tx.send(RemoteSetupStatus::StartingClient);
         LocalCannelloniClient::start_client(&ssh_host, port).await
             .map_err(|e| format!("Step 6 - Cannelloni client failed: {}", e))?;
 
@@ -896,10 +879,24 @@ impl Gui {
     fn try_remote_disconnect(&mut self) {
         log::info!("Disconnecting remote connection");
         
-        // Stop local cannelloni client
         let rt = tokio::runtime::Handle::current();
+        
+        // Stop local cannelloni client
         let _ = rt.block_on(async {
             LocalCannelloniClient::cleanup(false).await
+        });
+        
+        // Stop remote cannelloni server
+        let remote = RemoteConnection::new(
+            self.remote_ssh_host.clone(),
+            self.remote_ssh_user.clone(),
+            self.remote_ssh_password.clone(),
+            self.remote_can_interface.clone(),
+            self.selected_bitrate,
+            DEFAULT_CANNELLONI_PORT,
+        );
+        let _ = rt.block_on(async {
+            remote.stop_cannelloni_server().await
         });
         
         // Reset state
@@ -959,6 +956,9 @@ impl eframe::App for Gui {
             return;
         }
 
+        // Poll remote connection status (non-blocking)
+        self.poll_remote_connection_status();
+        
         // Show password popup if needed
         self.show_password_popup(ctx);
 
@@ -992,6 +992,13 @@ impl eframe::App for Gui {
 
                 ui.with_layout(Layout::right_to_left(egui::Align::RIGHT), |ui| {
                     ui.label(format!("{fps} FPS",));
+                    ui.separator();
+                    if ui.selectable_label(self.show_stats_panel, "📈")
+                        .on_hover_text(if self.show_stats_panel { "Masquer les statistiques" } else { "Afficher les statistiques" })
+                        .clicked() 
+                    {
+                        self.show_stats_panel = !self.show_stats_panel;
+                    }
                 });
             });
 
@@ -1016,26 +1023,33 @@ impl eframe::App for Gui {
                 });
             });
         
-        // Right side panel for detailed stats
-        egui::SidePanel::right("stats_panel")
-            .resizable(true)
-            .default_width(250.0)
-            .min_width(200.0)
-            .show(ctx, |ui| {
-                ui.add_enabled_ui(connected, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        self.show_stats_panel(ui);
+        // Right side panel for detailed stats (toggleable)
+        if self.show_stats_panel {
+            egui::SidePanel::right("stats_panel")
+                .resizable(true)
+                .default_width(250.0)
+                .min_width(200.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("📈 Stats");
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✖").on_hover_text("Masquer les statistiques").clicked() {
+                                self.show_stats_panel = false;
+                            }
+                        });
+                    });
+                    ui.separator();
+                    ui.add_enabled_ui(connected, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            self.show_stats_content(ui);
+                        });
                     });
                 });
-            });
+        }
         
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_enabled_ui(connected, |ui| {
-                // Dashboard at the top
-                self.show_dashboard(ui);
-                ui.separator();
-                
-                // Chart in the middle
+                // Chart at the top
                 self.chart.ui(ui);
                 ui.separator();
                 
@@ -1064,5 +1078,13 @@ impl eframe::App for Gui {
         });
 
         ctx.request_repaint();
+    }
+    
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Cleanup remote connection on app close
+        if self.is_remote_connected {
+            log::info!("App closing - cleaning up remote connection");
+            self.try_remote_disconnect();
+        }
     }
 }
