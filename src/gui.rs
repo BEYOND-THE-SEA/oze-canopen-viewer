@@ -8,7 +8,7 @@ use crate::{
     message_cached::MessageCached,
     message_sender::MessageSender,
     pinned_filter::PinnedFilters,
-    remote_connection::{LocalCannelloniClient, RemoteConnection, RemoteSetupStatus, DEFAULT_CANNELLONI_PORT},
+    remote_connection::{CleanupInfo, LocalCannelloniClient, RemoteConnection, RemoteSetupStatus, DEFAULT_CANNELLONI_PORT},
     theme::{theme, OZON_GRAY, OZON_PINK},
     viewer::Viewer,
 };
@@ -791,14 +791,24 @@ impl Gui {
             match &status {
                 RemoteSetupStatus::Connected => {
                     self.is_remote_connected = true;
-                    
+
+                    // Store cleanup info for signal handlers
+                    CleanupInfo::store(CleanupInfo {
+                        ssh_host: self.remote_ssh_host.clone(),
+                        ssh_user: self.remote_ssh_user.clone(),
+                        ssh_password: self.remote_ssh_password.clone(),
+                        port: DEFAULT_CANNELLONI_PORT,
+                    });
+
                     // Connect the viewer to vcan0
+                    // Use selected bitrate for stats calculation (bus occupation)
                     self.connection.can_name = "vcan0".to_string();
-                    self.connection.bitrate = None; // vcan0 doesn't need bitrate
+                    self.connection.bitrate = self.selected_bitrate;
                     self.send_driver_control();
                 }
                 RemoteSetupStatus::Failed(_) => {
                     self.is_remote_connected = false;
+                    CleanupInfo::clear();
                 }
                 _ => {}
             }
@@ -903,8 +913,11 @@ impl Gui {
         self.is_remote_connected = false;
         self.remote_setup_status = RemoteSetupStatus::Idle;
         
+        // Clear cleanup info (signal handlers no longer need to cleanup)
+        CleanupInfo::clear();
+
         // Note: Don't clear password so user can reconnect easily
-        
+
         log::info!("Remote connection disconnected");
     }
 

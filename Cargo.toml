@@ -31,6 +31,7 @@ pretty_env_logger = "0.5.0"
 regex = "1.11.1"
 tracing = "0.1.41"
 bitflags = { version = "2.5", features = ["serde"] }
+signal-hook = "0.3"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

@@ -3,6 +3,7 @@ use oze_canopen::interface::Connection;
 use oze_canopen_viewer::bitrate;
 use oze_canopen_viewer::driver::{self, Control, WriteCommand};
 use oze_canopen_viewer::gui::Gui;
+use oze_canopen_viewer::remote_connection::CleanupInfo;
 use std::sync::Arc;
 use std::thread;
 use tokio::runtime::Runtime;
@@ -17,9 +18,47 @@ struct Args {
     bitrate: Option<u32>,
 }
 
+/// Set up signal handlers for graceful cleanup
+fn setup_signal_handlers() {
+    // Handle SIGTERM (kill) and SIGINT (Ctrl+C)
+    #[cfg(unix)]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
+        
+        let cleanup = move || {
+            if !CLEANUP_DONE.swap(true, Ordering::SeqCst) {
+                log::info!("Received termination signal, cleaning up...");
+                CleanupInfo::cleanup_sync();
+            }
+        };
+        
+        // SIGTERM handler
+        let cleanup_term = cleanup.clone();
+        let _ = unsafe {
+            signal_hook::low_level::register(signal_hook::consts::SIGTERM, move || {
+                cleanup_term();
+                std::process::exit(0);
+            })
+        };
+        
+        // SIGINT handler (Ctrl+C)
+        let cleanup_int = cleanup;
+        let _ = unsafe {
+            signal_hook::low_level::register(signal_hook::consts::SIGINT, move || {
+                cleanup_int();
+                std::process::exit(0);
+            })
+        };
+    }
+}
+
 fn main() -> eframe::Result<()> {
     pretty_env_logger::init();
     let args = Args::parse();
+    
+    // Set up signal handlers for cleanup on SIGTERM/SIGINT
+    setup_signal_handlers();
 
     let initial_control = Control {
         command: driver::ControlCommand::Process,

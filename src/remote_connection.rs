@@ -9,10 +9,76 @@
 use std::path::PathBuf;
 use std::env;
 use std::process::Stdio;
+use std::sync::Mutex;
 use tokio::process::Command;
+
+/// Global storage for cleanup info (used by signal handlers)
+static CLEANUP_INFO: Mutex<Option<CleanupInfo>> = Mutex::new(None);
+
+/// Information needed to cleanup remote connection
+#[derive(Clone, Debug)]
+pub struct CleanupInfo {
+    pub ssh_host: String,
+    pub ssh_user: String,
+    pub ssh_password: String,
+    pub port: u16,
+}
+
+impl CleanupInfo {
+    /// Store cleanup info for signal handlers
+    pub fn store(info: CleanupInfo) {
+        if let Ok(mut guard) = CLEANUP_INFO.lock() {
+            *guard = Some(info);
+        }
+    }
+    
+    /// Clear stored cleanup info
+    pub fn clear() {
+        if let Ok(mut guard) = CLEANUP_INFO.lock() {
+            *guard = None;
+        }
+    }
+    
+    /// Get stored cleanup info
+    pub fn get() -> Option<CleanupInfo> {
+        CLEANUP_INFO.lock().ok().and_then(|guard| guard.clone())
+    }
+    
+    /// Perform cleanup (stop remote server and local client)
+    pub fn cleanup_sync() {
+        if let Some(info) = Self::get() {
+            log::info!("Signal handler: cleaning up remote connection to {}", info.ssh_host);
+            
+            // Use std::process::Command for sync context (signal handler)
+            // Stop local cannelloni client
+            let _ = std::process::Command::new("pkill")
+                .arg("-f")
+                .arg(format!("cannelloni.*-R {}.*-r {}", info.ssh_host, info.port))
+                .output();
+            
+            // Stop remote cannelloni server via SSH
+            let _ = std::process::Command::new("sshpass")
+                .arg("-p")
+                .arg(&info.ssh_password)
+                .arg("ssh")
+                .arg("-o").arg("StrictHostKeyChecking=no")
+                .arg("-o").arg("UserKnownHostsFile=/dev/null")
+                .arg("-o").arg("ConnectTimeout=5")
+                .arg(format!("{}@{}", info.ssh_user, info.ssh_host))
+                .arg(format!("sudo pkill -f 'cannelloni.*-l {}' 2>/dev/null || true", info.port))
+                .output();
+            
+            Self::clear();
+            log::info!("Signal handler: cleanup completed");
+        }
+    }
+}
 
 /// Default port for cannelloni TCP communication
 pub const DEFAULT_CANNELLONI_PORT: u16 = 29536;
+
+/// Default timeout for remote cannelloni server (auto-cleanup)
+pub const DEFAULT_SERVER_TIMEOUT: &str = "4h";
 
 /// Remote connection configuration and operations
 #[derive(Clone, Debug)]
@@ -269,8 +335,10 @@ impl RemoteConnection {
     /// Stop cannelloni server on the remote machine
     pub async fn stop_cannelloni_server(&self) -> Result<(), String> {
         log::info!("Stopping cannelloni server on port {}", self.port);
+        // Only kill the cannelloni server on our specific port
+        let command = format!("sudo pkill -f 'cannelloni.*-l {}' 2>/dev/null || true", self.port);
         let _ = self
-            .execute_ssh_command("sudo pkill -f 'cannelloni.*-C s' 2>/dev/null || true")
+            .execute_ssh_command(&command)
             .await;
         // Wait a bit for the process to stop
         tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
@@ -290,9 +358,10 @@ impl RemoteConnection {
         );
 
         // Use bash -c with disown to properly background the process
+        // timeout ensures auto-cleanup if app crashes without proper disconnect
         let command = format!(
-            "sudo bash -c 'cannelloni -I {} -C s -L 0.0.0.0 -l {} -p &' && sleep 1",
-            self.remote_can_interface, self.port
+            "sudo bash -c 'timeout {} cannelloni -I {} -C s -L 0.0.0.0 -l {} -p &' && sleep 1",
+            DEFAULT_SERVER_TIMEOUT, self.remote_can_interface, self.port
         );
 
         self.execute_ssh_command(&command).await?;
@@ -308,9 +377,9 @@ impl RemoteConnection {
             // Try alternative method with systemd-run if available
             log::warn!("First method failed, trying alternative...");
             let alt_command = format!(
-                "sudo systemd-run --scope cannelloni -I {} -C s -L 0.0.0.0 -l {} -p 2>/dev/null || sudo bash -c 'nohup cannelloni -I {} -C s -L 0.0.0.0 -l {} -p > /tmp/cannelloni.log 2>&1 &'",
-                self.remote_can_interface, self.port,
-                self.remote_can_interface, self.port
+                "sudo systemd-run --scope timeout {} cannelloni -I {} -C s -L 0.0.0.0 -l {} -p 2>/dev/null || sudo bash -c 'nohup timeout {} cannelloni -I {} -C s -L 0.0.0.0 -l {} -p > /tmp/cannelloni.log 2>&1 &'",
+                DEFAULT_SERVER_TIMEOUT, self.remote_can_interface, self.port,
+                DEFAULT_SERVER_TIMEOUT, self.remote_can_interface, self.port
             );
             self.execute_ssh_command(&alt_command).await?;
             
