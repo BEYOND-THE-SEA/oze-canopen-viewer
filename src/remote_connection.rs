@@ -298,10 +298,10 @@ impl RemoteConnection {
             ))
             .await;
 
-        // Configure bitrate if provided
+        // Configure bitrate if provided (interface must be DOWN)
         if let Some(br) = self.remote_bitrate {
             self.execute_ssh_command(&format!(
-                "sudo ip link set {} up type can bitrate {}",
+                "sudo ip link set {} type can bitrate {}",
                 self.remote_can_interface, br
             ))
             .await
