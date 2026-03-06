@@ -11,6 +11,7 @@ use std::env;
 use std::process::Stdio;
 use std::sync::Mutex;
 use tokio::process::Command;
+use tokio::io::AsyncWriteExt;
 
 /// Global storage for cleanup info (used by signal handlers)
 static CLEANUP_INFO: Mutex<Option<CleanupInfo>> = Mutex::new(None);
@@ -430,22 +431,55 @@ impl RemoteConnection {
     }
 }
 
+/// Run a local command with sudo, passing password via stdin
+async fn run_local_sudo(password: &str, args: &[&str]) -> Result<(), String> {
+    let mut child = Command::new("sudo")
+        .arg("-S")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn sudo: {}", e))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(format!("{password}\n").as_bytes())
+            .await
+            .map_err(|e| format!("Failed to write password: {}", e))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("Failed to wait for sudo: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let filtered: String = stderr
+            .lines()
+            .filter(|line| !line.contains("[sudo]") && !line.contains("password"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if !filtered.trim().is_empty() {
+            return Err(filtered);
+        }
+    }
+
+    Ok(())
+}
+
 /// Local cannelloni client management
 pub struct LocalCannelloniClient;
 
 impl LocalCannelloniClient {
-    /// Create the virtual CAN interface (vcan0)
-    pub async fn create_vcan_interface() -> Result<(), String> {
+    /// Create the virtual CAN interface (vcan0) using sudo with password
+    pub async fn create_vcan_interface_with_password(password: &str) -> Result<(), String> {
         log::info!("Creating virtual CAN interface vcan0");
 
         // Load vcan module
-        let _ = Command::new("sudo")
-            .arg("modprobe")
-            .arg("vcan")
-            .stderr(Stdio::piped())
-            .stdout(Stdio::piped())
-            .output()
-            .await;
+        let _ = run_local_sudo(password, &["modprobe", "vcan"]).await;
 
         // Check if vcan0 already exists
         let check = Command::new("ip")
@@ -460,48 +494,33 @@ impl LocalCannelloniClient {
         let vcan_exists = check.map(|o| o.status.success()).unwrap_or(false);
 
         if !vcan_exists {
-            let output = Command::new("sudo")
-                .arg("ip")
-                .arg("link")
-                .arg("add")
-                .arg("dev")
-                .arg("vcan0")
-                .arg("type")
-                .arg("vcan")
-                .stderr(Stdio::piped())
-                .stdout(Stdio::piped())
-                .output()
-                .await
-                .map_err(|e| format!("Failed to create vcan0: {}", e))?;
-
-            if !output.status.success() {
-                let error = String::from_utf8_lossy(&output.stderr);
-                if !error.contains("File exists") {
-                    return Err(format!("Failed to create vcan0: {}", error));
+            match run_local_sudo(
+                password,
+                &["ip", "link", "add", "dev", "vcan0", "type", "vcan"],
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    if !e.contains("File exists") {
+                        return Err(format!("Failed to create vcan0: {}", e));
+                    }
                 }
-            }
+            };
         }
 
         // Bring up the interface
-        let output = Command::new("sudo")
-            .arg("ip")
-            .arg("link")
-            .arg("set")
-            .arg("up")
-            .arg("vcan0")
-            .stderr(Stdio::piped())
-            .stdout(Stdio::piped())
-            .output()
+        run_local_sudo(password, &["ip", "link", "set", "up", "vcan0"])
             .await
             .map_err(|e| format!("Failed to bring vcan0 up: {}", e))?;
 
-        if !output.status.success() {
-            let error = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Failed to bring vcan0 up: {}", error));
-        }
-
         log::info!("Virtual CAN interface vcan0 created and up");
         Ok(())
+    }
+
+    /// Create the virtual CAN interface (vcan0) without explicit password (may fail if sudo requires it)
+    pub async fn create_vcan_interface() -> Result<(), String> {
+        Self::create_vcan_interface_with_password("").await
     }
 
     /// Check if cannelloni client is already running for the specified remote
@@ -518,26 +537,28 @@ impl LocalCannelloniClient {
         Ok(output.status.success())
     }
 
-    /// Stop cannelloni client
-    pub async fn stop_client() -> Result<(), String> {
+    /// Stop cannelloni client using sudo with password
+    pub async fn stop_client_with_password(password: &str) -> Result<(), String> {
         log::info!("Stopping local cannelloni client");
-        let _ = Command::new("sudo")
-            .arg("pkill")
-            .arg("-f")
-            .arg("cannelloni.*vcan0")
-            .stderr(Stdio::piped())
-            .stdout(Stdio::piped())
-            .output()
-            .await;
+        let _ = run_local_sudo(password, &["pkill", "-f", "cannelloni.*vcan0"]).await;
         // Wait for process to stop
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         Ok(())
     }
 
+    /// Stop cannelloni client without explicit password (may fail if sudo requires it)
+    pub async fn stop_client() -> Result<(), String> {
+        Self::stop_client_with_password("").await
+    }
+
     /// Start cannelloni client connecting to remote server
-    pub async fn start_client(remote_host: &str, port: u16) -> Result<(), String> {
+    pub async fn start_client_with_password(
+        remote_host: &str,
+        port: u16,
+        password: &str,
+    ) -> Result<(), String> {
         // Stop any existing client first
-        Self::stop_client().await?;
+        Self::stop_client_with_password(password).await?;
 
         let cannelloni_path = RemoteConnection::get_cannelloni_binary_path();
 
@@ -554,35 +575,32 @@ impl LocalCannelloniClient {
             port
         );
 
-        // Start cannelloni client in background
-        let output = Command::new("sudo")
-            .arg(cannelloni_path.to_str().unwrap())
-            .arg("-I")
-            .arg("vcan0")
-            .arg("-C")
-            .arg("c")
-            .arg("-R")
-            .arg(remote_host)
-            .arg("-r")
-            .arg(&port.to_string())
-            .stderr(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn();
+        let cmd = format!(
+            "{} -I vcan0 -C c -R {} -r {}",
+            cannelloni_path.to_str().unwrap(),
+            remote_host,
+            port
+        );
+        let bash_cmd = format!("{cmd} &");
 
-        match output {
-            Ok(_child) => {
-                // Wait for client to connect
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        run_local_sudo(password, &["bash", "-c", &bash_cmd])
+            .await
+            .map_err(|e| format!("Failed to start cannelloni client: {}", e))?;
 
-                if Self::check_client_running(remote_host).await? {
-                    log::info!("Cannelloni client started successfully");
-                    Ok(())
-                } else {
-                    Err("Cannelloni client failed to start or connect".to_string())
-                }
-            }
-            Err(e) => Err(format!("Failed to start cannelloni client: {}", e)),
+        // Wait for client to connect
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        if Self::check_client_running(remote_host).await? {
+            log::info!("Cannelloni client started successfully");
+            Ok(())
+        } else {
+            Err("Cannelloni client failed to start or connect".to_string())
         }
+    }
+
+    /// Start cannelloni client connecting to remote server without explicit password
+    pub async fn start_client(remote_host: &str, port: u16) -> Result<(), String> {
+        Self::start_client_with_password(remote_host, port, "").await
     }
 
     /// Complete local setup: create vcan0 and start client with status callback
@@ -604,24 +622,21 @@ impl LocalCannelloniClient {
         Self::setup_local_with_status(remote_host, port, |_| {}).await
     }
 
-    /// Stop all local cannelloni processes and optionally remove vcan0
-    pub async fn cleanup(remove_vcan: bool) -> Result<(), String> {
-        Self::stop_client().await?;
+    /// Stop all local cannelloni processes and optionally remove vcan0 using sudo with password
+    pub async fn cleanup_with_password(remove_vcan: bool, password: &str) -> Result<(), String> {
+        Self::stop_client_with_password(password).await?;
 
         if remove_vcan {
             log::info!("Removing vcan0 interface");
-            let _ = Command::new("sudo")
-                .arg("ip")
-                .arg("link")
-                .arg("delete")
-                .arg("vcan0")
-                .stderr(Stdio::piped())
-                .stdout(Stdio::piped())
-                .output()
-                .await;
+            let _ = run_local_sudo(password, &["ip", "link", "delete", "vcan0"]).await;
         }
 
         Ok(())
+    }
+
+    /// Stop all local cannelloni processes and optionally remove vcan0 without explicit password
+    pub async fn cleanup(remove_vcan: bool) -> Result<(), String> {
+        Self::cleanup_with_password(remove_vcan, "").await
     }
 }
 

@@ -89,6 +89,9 @@ pub struct Gui {
     config_status: Option<Result<String, String>>,
     pending_action: Option<PendingAction>,
 
+    // Local sudo password (for CAN and vcan0 operations)
+    local_sudo_password: String,
+
     // Remote connection state
     connection_mode: ConnectionMode,
     remote_ssh_host: String,
@@ -154,6 +157,7 @@ impl Gui {
             password_input: String::new(),
             config_status: None,
             pending_action: None,
+            local_sudo_password: String::new(),
             // Remote connection state
             connection_mode: ConnectionMode::Local,
             remote_ssh_host: String::new(),
@@ -514,6 +518,15 @@ impl Gui {
                 .desired_width(120.0),
         ).on_hover_text("SSH password (also used for sudo on remote)");
 
+        // Local sudo password (for vcan0 and local cannelloni client)
+        ui.add_enabled(
+            !self.is_remote_connected && !is_connecting,
+            TextEdit::singleline(&mut self.local_sudo_password)
+                .hint_text("Local sudo")
+                .password(true)
+                .desired_width(120.0),
+        ).on_hover_text("Local sudo password (used to create vcan0 and start the local cannelloni client)");
+
         // Remote CAN interface
         ui.add_enabled(
             !self.is_remote_connected && !is_connecting,
@@ -554,7 +567,8 @@ impl Gui {
                 && !self.remote_ssh_user.is_empty()
                 && !self.remote_ssh_password.is_empty()
                 && !self.remote_can_interface.is_empty()
-                && self.selected_bitrate.is_some();
+                && self.selected_bitrate.is_some()
+                && !self.local_sudo_password.is_empty();
             
             if ui.add_enabled(button_enabled, Button::new("🔌 Connect")).clicked() {
                 // Connect directly without popup
@@ -609,6 +623,13 @@ impl Gui {
                     // Only show password field if needed
                     if !password_hint.is_empty() {
                         ui.horizontal(|ui| {
+                            if self.config_status.is_none()
+                                && self.password_input.is_empty()
+                                && !self.local_sudo_password.is_empty()
+                            {
+                                self.password_input = self.local_sudo_password.clone();
+                            }
+
                             ui.label(format!("{}:", password_hint));
                             let response = ui.add(
                                 TextEdit::singleline(&mut self.password_input)
@@ -676,7 +697,10 @@ impl Gui {
             Ok(()) => {
                 log::info!("CAN interface disconnected successfully");
                 self.is_interface_up = false;
-                
+
+                // Remember local sudo password for future operations (e.g. remote vcan0)
+                self.local_sudo_password = self.password_input.clone();
+
                 // Close popup and clear password
                 self.show_password_popup = false;
                 self.password_input.clear();
@@ -712,7 +736,10 @@ impl Gui {
                 self.connection.can_name = self.can_name_raw.clone();
                 self.connection.bitrate = bitrate;
                 self.send_driver_control();
-                
+
+                // Remember local sudo password for future operations (e.g. remote vcan0)
+                self.local_sudo_password = self.password_input.clone();
+
                 // Close the popup and clear password
                 self.show_password_popup = false;
                 self.password_input.clear();
@@ -742,6 +769,7 @@ impl Gui {
         let can_interface = self.remote_can_interface.clone();
         let bitrate = self.selected_bitrate;
         let port = DEFAULT_CANNELLONI_PORT;
+        let local_sudo_password = self.local_sudo_password.clone();
         
         // Spawn the async setup task (non-blocking)
         tokio::spawn(async move {
@@ -752,8 +780,10 @@ impl Gui {
                 can_interface,
                 bitrate,
                 port,
+                local_sudo_password,
                 tx.clone(),
-            ).await;
+            )
+            .await;
             
             // Send final status
             match result {
@@ -829,6 +859,7 @@ impl Gui {
         can_interface: String,
         bitrate: Option<u32>,
         port: u16,
+        local_sudo_password: String,
         status_tx: std_mpsc::Sender<RemoteSetupStatus>,
     ) -> Result<(), String> {
         // Create remote connection handler
@@ -874,14 +905,20 @@ impl Gui {
         // Step 5: Create local vcan0
         log::info!("Step 5/6: Creating local vcan0 interface...");
         let _ = status_tx.send(RemoteSetupStatus::CreatingVcan);
-        LocalCannelloniClient::create_vcan_interface().await
+        LocalCannelloniClient::create_vcan_interface_with_password(&local_sudo_password)
+            .await
             .map_err(|e| format!("Step 5 - Failed to create vcan0: {}", e))?;
 
         // Step 6: Start cannelloni client
         log::info!("Step 6/6: Starting cannelloni client...");
         let _ = status_tx.send(RemoteSetupStatus::StartingClient);
-        LocalCannelloniClient::start_client(&ssh_host, port).await
-            .map_err(|e| format!("Step 6 - Cannelloni client failed: {}", e))?;
+        LocalCannelloniClient::start_client_with_password(
+            &ssh_host,
+            port,
+            &local_sudo_password,
+        )
+        .await
+        .map_err(|e| format!("Step 6 - Cannelloni client failed: {}", e))?;
 
         Ok(())
     }
@@ -893,7 +930,7 @@ impl Gui {
         
         // Stop local cannelloni client
         let _ = rt.block_on(async {
-            LocalCannelloniClient::cleanup(false).await
+            LocalCannelloniClient::cleanup_with_password(false, &self.local_sudo_password).await
         });
         
         // Stop remote cannelloni server
