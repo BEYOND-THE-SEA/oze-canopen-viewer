@@ -52,6 +52,16 @@ enum PendingAction {
     Disconnect,
 }
 
+#[derive(Clone, Debug)]
+struct InterfaceDetails {
+    scope: &'static str,
+    name: String,
+    state: String,
+    interface_type: String,
+    bitrate: Option<String>,
+    extras: Vec<String>,
+}
+
 pub struct Gui {
     data: VecDeque<MessageCached>,
     driver: watch::Receiver<State>,
@@ -92,6 +102,10 @@ pub struct Gui {
     // Local sudo password (for CAN and vcan0 operations)
     local_sudo_password: String,
 
+    // Interface diagnostics
+    local_interface_details: Option<InterfaceDetails>,
+    remote_interface_details: Option<InterfaceDetails>,
+
     // Remote connection state
     connection_mode: ConnectionMode,
     remote_ssh_host: String,
@@ -129,6 +143,8 @@ impl Gui {
         // Default to 250 kbit/s if no bitrate is provided (most common CANopen bitrate)
         let selected_bitrate = connection_data.bitrate.or(Some(250_000));
 
+        let local_interface_details = Self::query_local_interface_details(&can_name_raw);
+
         Self {
             fps: VecDeque::new(),
             bus_load_history: VecDeque::new(),
@@ -158,6 +174,8 @@ impl Gui {
             config_status: None,
             pending_action: None,
             local_sudo_password: String::new(),
+            local_interface_details,
+            remote_interface_details: None,
             // Remote connection state
             connection_mode: ConnectionMode::Local,
             remote_ssh_host: String::new(),
@@ -340,6 +358,207 @@ impl Gui {
         });
     }
 
+    fn sudo_error_message(stderr: &str) -> String {
+        let lowercase = stderr.to_lowercase();
+        let filtered_error: String = stderr
+            .lines()
+            .filter(|line| !line.contains("[sudo]") && !line.contains("password"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if lowercase.contains("incorrect password")
+            || lowercase.contains("sorry, try again")
+            || lowercase.contains("a password is required")
+            || lowercase.contains("authentication")
+        {
+            "Local sudo authentication failed".to_string()
+        } else if filtered_error.trim().is_empty() {
+            "Local sudo command failed".to_string()
+        } else {
+            filtered_error
+        }
+    }
+
+    fn is_sudo_auth_error(error: &str) -> bool {
+        let lowercase = error.to_lowercase();
+        lowercase.contains("sudo authentication failed")
+            || lowercase.contains("incorrect password")
+            || lowercase.contains("sorry, try again")
+            || lowercase.contains("authentication")
+    }
+
+    fn query_local_interface_details(interface_name: &str) -> Option<InterfaceDetails> {
+        if interface_name.is_empty() {
+            return None;
+        }
+
+        let output = Command::new("ip")
+            .args(["-details", "link", "show", interface_name])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let details = String::from_utf8_lossy(&output.stdout).to_string();
+        Some(Self::parse_interface_details("Local", interface_name, &details))
+    }
+
+    fn parse_interface_details(
+        scope: &'static str,
+        interface_name: &str,
+        details: &str,
+    ) -> InterfaceDetails {
+        let mut state = "UNKNOWN".to_string();
+        let mut bitrate = None;
+        let mut extras = Vec::new();
+        let mut interface_type = if interface_name.starts_with("vcan") {
+            "vcan".to_string()
+        } else {
+            "can".to_string()
+        };
+
+        if let Some(first_line) = details.lines().next() {
+            if let Some(flags) = first_line.split('<').nth(1).and_then(|part| part.split('>').next())
+            {
+                extras.push(format!("flags {}", flags));
+            }
+
+            let tokens: Vec<_> = first_line.split_whitespace().collect();
+            for window in tokens.windows(2) {
+                match window {
+                    ["mtu", value] => extras.push(format!("mtu {}", value)),
+                    ["qdisc", value] => extras.push(format!("qdisc {}", value)),
+                    ["state", value] => state = (*value).to_string(),
+                    _ => {}
+                }
+            }
+        }
+
+        for line in details.lines().skip(1) {
+            let tokens: Vec<_> = line.split_whitespace().collect();
+            for window in tokens.windows(2) {
+                match window {
+                    ["bitrate", value] => bitrate = Some((*value).to_string()),
+                    ["link/can", _] if interface_name.starts_with("vcan") => {
+                        interface_type = "vcan".to_string();
+                    }
+                    ["link/can", _] => interface_type = "can".to_string(),
+                    _ => {}
+                }
+            }
+        }
+
+        InterfaceDetails {
+            scope,
+            name: interface_name.to_string(),
+            state,
+            interface_type,
+            bitrate,
+            extras,
+        }
+    }
+
+    fn refresh_local_interface_details(&mut self, interface_name: &str) {
+        self.local_interface_details = Self::query_local_interface_details(interface_name);
+    }
+
+    fn refresh_remote_interface_details(&mut self) {
+        let remote = RemoteConnection::new(
+            self.remote_ssh_host.clone(),
+            self.remote_ssh_user.clone(),
+            self.remote_ssh_password.clone(),
+            self.remote_can_interface.clone(),
+            self.selected_bitrate,
+            DEFAULT_CANNELLONI_PORT,
+        );
+
+        let details = tokio::runtime::Handle::current()
+            .block_on(async { remote.get_interface_details().await.ok() });
+        self.remote_interface_details = details
+            .map(|raw| Self::parse_interface_details("Remote", &self.remote_can_interface, &raw));
+    }
+
+    fn show_interface_details(ui: &mut Ui, details: &InterfaceDetails) {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(format!("{} {}:", details.scope, details.name));
+            ui.monospace(format!(
+                "{} | type {}",
+                details.state, details.interface_type
+            ));
+            if let Some(bitrate) = &details.bitrate {
+                ui.monospace(format!("bitrate {}", bitrate));
+            }
+            for extra in &details.extras {
+                ui.monospace(extra);
+            }
+        });
+    }
+
+    fn show_connection_feedback(&self, ui: &mut Ui) {
+        let has_interface_details =
+            self.local_interface_details.is_some() || self.remote_interface_details.is_some();
+        let show_remote_status =
+            !matches!(self.remote_setup_status, RemoteSetupStatus::Idle | RemoteSetupStatus::Connected);
+
+        if !has_interface_details && !show_remote_status {
+            return;
+        }
+
+        ui.separator();
+
+        if let Some(details) = &self.local_interface_details {
+            Self::show_interface_details(ui, details);
+        }
+
+        if let Some(details) = &self.remote_interface_details {
+            Self::show_interface_details(ui, details);
+        }
+
+        if show_remote_status {
+            ui.add_space(4.0);
+            match &self.remote_setup_status {
+                RemoteSetupStatus::Failed(msg) => {
+                    ui.colored_label(egui::Color32::RED, "Remote error:");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(msg);
+                    });
+                }
+                status => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(egui::Color32::YELLOW, "Remote status:");
+                        ui.label(status.to_string());
+                    });
+                }
+            }
+        }
+    }
+
+    fn open_local_password_popup(&mut self, action: PendingAction) {
+        self.show_password_popup = true;
+        self.password_input.clear();
+        self.config_status = None;
+        self.pending_action = Some(action);
+    }
+
+    fn start_local_action(&mut self, action: PendingAction) {
+        if self.local_sudo_password.is_empty() {
+            self.open_local_password_popup(action);
+            return;
+        }
+
+        self.password_input = self.local_sudo_password.clone();
+        self.config_status = None;
+        self.pending_action = Some(action);
+        self.execute_pending_action();
+        if self.config_status.is_some() && !self.show_password_popup {
+            self.show_password_popup = true;
+        }
+    }
+
     /// Run a command with sudo using password via stdin
     fn run_sudo_command(password: &str, args: &[&str]) -> Result<(), String> {
         let mut child = Command::new("sudo")
@@ -363,15 +582,7 @@ impl Gui {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // Filter out the password prompt from error message
-            let filtered_error: String = stderr
-                .lines()
-                .filter(|line| !line.contains("[sudo]") && !line.contains("password"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !filtered_error.trim().is_empty() {
-                return Err(filtered_error);
-            }
+            return Err(Self::sudo_error_message(&stderr));
         }
 
         Ok(())
@@ -431,7 +642,7 @@ impl Gui {
 
     fn show_local_connect_ui(&mut self, ui: &mut Ui) {
         // Disable interface name and bitrate when connected
-        ui.add_enabled(
+        let can_name_response = ui.add_enabled(
             !self.is_interface_up,
             TextEdit::singleline(&mut self.can_name_raw)
                 .hint_text("can name")
@@ -461,10 +672,7 @@ impl Gui {
         if self.is_interface_up {
             // Disconnect button
             if ui.button("🔌 Disconnect").clicked() {
-                self.show_password_popup = true;
-                self.password_input.clear();
-                self.config_status = None;
-                self.pending_action = Some(PendingAction::Disconnect);
+                self.start_local_action(PendingAction::Disconnect);
             }
         } else {
             // Connect button
@@ -473,10 +681,14 @@ impl Gui {
                 .add_enabled(button_enabled, Button::new("🔌 Connect"))
                 .clicked()
             {
-                self.show_password_popup = true;
-                self.password_input.clear();
-                self.config_status = None;
-                self.pending_action = Some(PendingAction::Connect);
+                self.start_local_action(PendingAction::Connect);
+            }
+
+            if button_enabled
+                && can_name_response.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+            {
+                self.start_local_action(PendingAction::Connect);
             }
         }
     }
@@ -494,7 +706,7 @@ impl Gui {
         );
 
         // SSH Host
-        ui.add_enabled(
+        let ssh_host_response = ui.add_enabled(
             !self.is_remote_connected && !is_connecting,
             TextEdit::singleline(&mut self.remote_ssh_host)
                 .hint_text("Host (IP ou nom)")
@@ -502,7 +714,7 @@ impl Gui {
         ).on_hover_text("IP address or hostname of the remote machine (e.g., 192.168.0.166 or pc-bts3.local)");
 
         // SSH User
-        ui.add_enabled(
+        let ssh_user_response = ui.add_enabled(
             !self.is_remote_connected && !is_connecting,
             TextEdit::singleline(&mut self.remote_ssh_user)
                 .hint_text("User")
@@ -510,7 +722,7 @@ impl Gui {
         ).on_hover_text("SSH username");
 
         // SSH Password
-        ui.add_enabled(
+        let ssh_password_response = ui.add_enabled(
             !self.is_remote_connected && !is_connecting,
             TextEdit::singleline(&mut self.remote_ssh_password)
                 .hint_text("Password")
@@ -519,16 +731,21 @@ impl Gui {
         ).on_hover_text("SSH password (also used for sudo on remote)");
 
         // Local sudo password (for vcan0 and local cannelloni client)
-        ui.add_enabled(
+        let local_sudo_hint = if self.local_sudo_password.is_empty() {
+            "Local sudo"
+        } else {
+            "Local sudo (cached)"
+        };
+        let local_sudo_response = ui.add_enabled(
             !self.is_remote_connected && !is_connecting,
             TextEdit::singleline(&mut self.local_sudo_password)
-                .hint_text("Local sudo")
+                .hint_text(local_sudo_hint)
                 .password(true)
                 .desired_width(120.0),
         ).on_hover_text("Local sudo password (used to create vcan0 and start the local cannelloni client)");
 
         // Remote CAN interface
-        ui.add_enabled(
+        let remote_can_response = ui.add_enabled(
             !self.is_remote_connected && !is_connecting,
             TextEdit::singleline(&mut self.remote_can_interface)
                 .hint_text("can0")
@@ -569,23 +786,22 @@ impl Gui {
                 && !self.remote_can_interface.is_empty()
                 && self.selected_bitrate.is_some()
                 && !self.local_sudo_password.is_empty();
-            
+
             if ui.add_enabled(button_enabled, Button::new("🔌 Connect")).clicked() {
-                // Connect directly without popup
                 self.try_remote_connect();
             }
-        }
 
-        // Show status
-        if !matches!(self.remote_setup_status, RemoteSetupStatus::Idle | RemoteSetupStatus::Connected) {
-            ui.separator();
-            match &self.remote_setup_status {
-                RemoteSetupStatus::Failed(msg) => {
-                    ui.colored_label(egui::Color32::RED, format!("❌ {}", msg));
-                }
-                status => {
-                    ui.colored_label(egui::Color32::YELLOW, format!("⏳ {}", status));
-                }
+            let submit_from_keyboard = ssh_host_response.lost_focus()
+                || ssh_user_response.lost_focus()
+                || ssh_password_response.lost_focus()
+                || local_sudo_response.lost_focus()
+                || remote_can_response.lost_focus();
+
+            if button_enabled
+                && submit_from_keyboard
+                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+            {
+                self.try_remote_connect();
             }
         }
     }
@@ -642,10 +858,7 @@ impl Gui {
                                 response.request_focus();
                             }
 
-                            // Submit on Enter key
-                            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                self.execute_pending_action();
-                            }
+                            let _ = response;
                         });
                     }
 
@@ -662,6 +875,10 @@ impl Gui {
                             }
                         }
                         ui.add_space(5.0);
+                    }
+
+                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        self.execute_pending_action();
                     }
 
                     ui.horizontal(|ui| {
@@ -706,10 +923,24 @@ impl Gui {
                 self.password_input.clear();
                 self.config_status = None;
                 self.pending_action = None;
+                let can_name = self.can_name_raw.clone();
+                self.refresh_local_interface_details(&can_name);
             }
             Err(e) => {
                 log::error!("Failed to disconnect CAN interface: {}", e);
-                self.config_status = Some(Err(e));
+                let needs_reauth = Self::is_sudo_auth_error(&e);
+                if needs_reauth {
+                    self.local_sudo_password.clear();
+                }
+
+                if !self.show_password_popup && needs_reauth {
+                    self.open_local_password_popup(PendingAction::Disconnect);
+                    self.config_status = Some(Err(
+                        "Stored sudo password was rejected. Please enter it again.".to_string(),
+                    ));
+                } else {
+                    self.config_status = Some(Err(e));
+                }
             }
         }
     }
@@ -725,7 +956,7 @@ impl Gui {
 
     fn try_configure_and_connect(&mut self) {
         let bitrate = self.selected_bitrate;
-        
+
         // Configure the CAN interface with the provided password
         match Self::configure_can_interface(&self.can_name_raw, bitrate, &self.password_input) {
             Ok(()) => {
@@ -745,11 +976,24 @@ impl Gui {
                 self.password_input.clear();
                 self.config_status = None;
                 self.pending_action = None;
+                let can_name = self.can_name_raw.clone();
+                self.refresh_local_interface_details(&can_name);
             }
             Err(e) => {
                 log::error!("Failed to configure CAN interface: {}", e);
-                self.config_status = Some(Err(e));
-                // Don't clear password so user can retry
+                let needs_reauth = Self::is_sudo_auth_error(&e);
+                if needs_reauth {
+                    self.local_sudo_password.clear();
+                }
+
+                if !self.show_password_popup && needs_reauth {
+                    self.open_local_password_popup(PendingAction::Connect);
+                    self.config_status = Some(Err(
+                        "Stored sudo password was rejected. Please enter it again.".to_string(),
+                    ));
+                } else {
+                    self.config_status = Some(Err(e));
+                }
             }
         }
     }
@@ -758,6 +1002,7 @@ impl Gui {
         // Create a channel for status updates
         let (tx, rx) = std_mpsc::channel();
         self.remote_status_receiver = Some(rx);
+        self.remote_interface_details = None;
         
         // Start the remote connection process
         self.remote_setup_status = RemoteSetupStatus::TestingConnection;
@@ -835,10 +1080,16 @@ impl Gui {
                     self.connection.can_name = "vcan0".to_string();
                     self.connection.bitrate = self.selected_bitrate;
                     self.send_driver_control();
+                    self.refresh_local_interface_details("vcan0");
+                    self.refresh_remote_interface_details();
                 }
-                RemoteSetupStatus::Failed(_) => {
+                RemoteSetupStatus::Failed(msg) => {
                     self.is_remote_connected = false;
                     CleanupInfo::clear();
+                    self.remote_interface_details = None;
+                    if Self::is_sudo_auth_error(msg) {
+                        self.local_sudo_password.clear();
+                    }
                 }
                 _ => {}
             }
@@ -929,9 +1180,14 @@ impl Gui {
         let rt = tokio::runtime::Handle::current();
         
         // Stop local cannelloni client
-        let _ = rt.block_on(async {
+        let cleanup_result = rt.block_on(async {
             LocalCannelloniClient::cleanup_with_password(false, &self.local_sudo_password).await
         });
+        if let Err(err) = cleanup_result {
+            if Self::is_sudo_auth_error(&err) {
+                self.local_sudo_password.clear();
+            }
+        }
         
         // Stop remote cannelloni server
         let remote = RemoteConnection::new(
@@ -949,6 +1205,8 @@ impl Gui {
         // Reset state
         self.is_remote_connected = false;
         self.remote_setup_status = RemoteSetupStatus::Idle;
+        self.remote_interface_details = None;
+        self.refresh_local_interface_details("vcan0");
         
         // Clear cleanup info (signal handlers no longer need to cleanup)
         CleanupInfo::clear();
@@ -1013,43 +1271,47 @@ impl eframe::App for Gui {
         self.show_password_popup(ctx);
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                self.show_connect_ui(ui);
-                ui.separator();
-
-                self.show_format_ui(ui);
-                ui.separator();
-
-                ui.label(format!(
-                    "rx {} tx {}",
-                    self.info.receiver_socket, self.info.transmitter_socket,
-                ));
-
-                ui.separator();
-                ui.label(format!("packets={}", self.data.len()));
-
-                ui.separator();
-                if let Some(bus_load) = self.calc_bus_load() {
-                    let color = if bus_load > 80.0 {
-                        egui::Color32::RED
-                    } else if bus_load > 50.0 {
-                        egui::Color32::YELLOW
-                    } else {
-                        egui::Color32::GREEN
-                    };
-                    ui.colored_label(color, format!("Bus: {:.1}%", bus_load));
-                }
-
-                ui.with_layout(Layout::right_to_left(egui::Align::RIGHT), |ui| {
-                    ui.label(format!("{fps} FPS",));
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    self.show_connect_ui(ui);
                     ui.separator();
-                    if ui.selectable_label(self.show_stats_panel, "📈")
-                        .on_hover_text(if self.show_stats_panel { "Masquer les statistiques" } else { "Afficher les statistiques" })
-                        .clicked() 
-                    {
-                        self.show_stats_panel = !self.show_stats_panel;
+
+                    self.show_format_ui(ui);
+                    ui.separator();
+
+                    ui.label(format!(
+                        "rx {} tx {}",
+                        self.info.receiver_socket, self.info.transmitter_socket,
+                    ));
+
+                    ui.separator();
+                    ui.label(format!("packets={}", self.data.len()));
+
+                    ui.separator();
+                    if let Some(bus_load) = self.calc_bus_load() {
+                        let color = if bus_load > 80.0 {
+                            egui::Color32::RED
+                        } else if bus_load > 50.0 {
+                            egui::Color32::YELLOW
+                        } else {
+                            egui::Color32::GREEN
+                        };
+                        ui.colored_label(color, format!("Bus: {:.1}%", bus_load));
                     }
+
+                    ui.with_layout(Layout::right_to_left(egui::Align::RIGHT), |ui| {
+                        ui.label(format!("{fps} FPS",));
+                        ui.separator();
+                        if ui.selectable_label(self.show_stats_panel, "📈")
+                            .on_hover_text(if self.show_stats_panel { "Masquer les statistiques" } else { "Afficher les statistiques" })
+                            .clicked()
+                        {
+                            self.show_stats_panel = !self.show_stats_panel;
+                        }
+                    });
                 });
+
+                self.show_connection_feedback(ui);
             });
 
             if !connected {

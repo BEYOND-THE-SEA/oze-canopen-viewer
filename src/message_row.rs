@@ -18,13 +18,19 @@ impl Default for MessageRow {
 }
 
 impl MessageRow {
+    fn separator(ui: &mut egui::Ui) {
+        ui.weak("·");
+    }
+
     pub fn header(&self, ui: &mut egui::Ui) {
         self.header_custom(ui, "     Timestamp");
     }
 
     pub fn header_custom(&self, ui: &mut egui::Ui, time: &str) {
         ui.label(time);
+        Self::separator(ui);
         ui.label("COB ID");
+        Self::separator(ui);
         ui.label(match self.format {
             RxMessageToStringFormat::Binary => {
                 " Binary data                                                            "
@@ -38,8 +44,11 @@ impl MessageRow {
             RxMessageToStringFormat::Utf8 => "UTF8 data",
         });
 
+        Self::separator(ui);
         ui.label("Packet type");
+        Self::separator(ui);
         ui.label("Node ID");
+        Self::separator(ui);
         ui.label("Info");
     }
 
@@ -61,15 +70,20 @@ impl MessageRow {
         };
 
         ui.label(time);
+        Self::separator(ui);
         ui.label(cob);
+        Self::separator(ui);
         ui.label(data).on_hover_ui(|ui| {
             // data in all formats on hover
             ui.label(format!("HEX:   {}", d.hex_str));
             ui.label(format!("BIN:   {}", d.bin_str));
             ui.label(format!("ASCII: {}", d.ascii_str));
         });
+        Self::separator(ui);
         ui.label(desc);
+        Self::separator(ui);
         ui.label(node_id);
+        Self::separator(ui);
         ui.label(d.additional.to_string())
             .on_hover_text_at_pointer(d.additional.get_tooltip());
     }

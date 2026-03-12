@@ -324,6 +324,15 @@ impl RemoteConnection {
         Ok(())
     }
 
+    /// Read remote CAN interface details via `ip -details link show`
+    pub async fn get_interface_details(&self) -> Result<String, String> {
+        self.execute_ssh_command(&format!(
+            "ip -details link show {}",
+            self.remote_can_interface
+        ))
+        .await
+    }
+
     /// Check if cannelloni server is already running
     pub async fn check_cannelloni_server_running(&self) -> Result<bool, String> {
         // Check if cannelloni process is running (simpler and more reliable)
@@ -456,15 +465,26 @@ async fn run_local_sudo(password: &str, args: &[&str]) -> Result<(), String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let lowercase = stderr.to_lowercase();
         let filtered: String = stderr
             .lines()
             .filter(|line| !line.contains("[sudo]") && !line.contains("password"))
             .collect::<Vec<_>>()
             .join("\n");
 
+        if lowercase.contains("incorrect password")
+            || lowercase.contains("sorry, try again")
+            || lowercase.contains("a password is required")
+            || lowercase.contains("authentication")
+        {
+            return Err("Local sudo authentication failed".to_string());
+        }
+
         if !filtered.trim().is_empty() {
             return Err(filtered);
         }
+
+        return Err("Local sudo command failed".to_string());
     }
 
     Ok(())

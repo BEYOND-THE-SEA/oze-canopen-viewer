@@ -35,7 +35,7 @@ impl PinnedFilters {
 
     pub fn update(&mut self, ui: &mut egui::Ui) {
         let row_spacing = 4.0;
-        let column_spacing = 5.0;
+        let column_spacing = 12.0;
         let text_style = egui::TextStyle::Body;
         let text_height = ui.text_style_height(&text_style);
         let height = text_height + row_spacing;
