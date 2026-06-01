@@ -29,8 +29,8 @@ impl Viewer {
         //     }
         // }
 
-        let row_spacing = 4.0;
-        let column_spacing = 26.0;
+        let row_spacing = 3.0;
+        let column_spacing = 13.5;
         let text_style = egui::TextStyle::Body;
         let text_height = ui.text_style_height(&text_style);
         let height = text_height + row_spacing;

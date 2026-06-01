@@ -19,7 +19,7 @@ impl Chart {
         // Display Y-axis label manually on the left with spacing
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
-                ui.add_space(120.0); // Center the label vertically
+                ui.add_space(60.0); // Center the label vertically
                 ui.label(
                     egui::RichText::new("Bitrate\n(bits/s)")
                         .size(11.0)
@@ -29,7 +29,7 @@ impl Chart {
             ui.add_space(5.0); // Space between label and plot
             
             let plot = Plot::new("plot")
-                .height(250.0)
+                .height(125.0)
                 .allow_drag(false)
                 .allow_boxed_zoom(false)
                 .allow_scroll(false)

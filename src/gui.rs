@@ -7,7 +7,6 @@ use crate::{
     filter_panel::FilterPanel,
     message_cached::MessageCached,
     message_sender::MessageSender,
-    pinned_filter::PinnedFilters,
     remote_connection::{CleanupInfo, LocalCannelloniClient, RemoteConnection, RemoteSetupStatus, DEFAULT_CANNELLONI_PORT},
     theme::{theme, OZON_GRAY, OZON_PINK},
     viewer::Viewer,
@@ -65,7 +64,6 @@ struct InterfaceDetails {
 pub struct Gui {
     data: VecDeque<MessageCached>,
     driver: watch::Receiver<State>,
-    pinned_filters: PinnedFilters,
     viewer: Viewer,
     chart: chart::Chart,
     last: Instant,
@@ -150,7 +148,6 @@ impl Gui {
             bus_load_history: VecDeque::new(),
             bus_stats: BusStats::new(),
             data: VecDeque::new(),
-            pinned_filters: PinnedFilters::default(),
             info: CanOpenInfo::default(),
             connection: connection_data,
             format: RxMessageToStringFormat::Hex,
@@ -219,7 +216,6 @@ impl Gui {
             // Update bus statistics
             self.bus_stats.on_message(i.msg.msg.cob_id, now);
             
-            self.pinned_filters.push_data(i);
             if !self.global_filter.borrow().filter(i) {
                 self.data.push_front(i.clone());
             }
@@ -1279,13 +1275,33 @@ impl eframe::App for Gui {
                     self.show_format_ui(ui);
                     ui.separator();
 
-                    ui.label(format!(
-                        "rx {} tx {}",
-                        self.info.receiver_socket, self.info.transmitter_socket,
-                    ));
+                    let rx_state = if self.info.receiver_socket {
+                        "actif"
+                    } else {
+                        "inactif"
+                    };
+                    ui.label(format!("CAN rx: {rx_state}")).on_hover_text(
+                        "Socket CAN de réception ouvert ; « actif » après au moins une trame lue. \
+                         Ce n'est pas un compteur de messages.",
+                    );
 
                     ui.separator();
-                    ui.label(format!("packets={}", self.data.len()));
+
+                    let tx_state = if self.info.transmitter_socket {
+                        "actif"
+                    } else {
+                        "inactif"
+                    };
+                    ui.label(format!("CAN tx: {tx_state}")).on_hover_text(
+                        "Socket CAN d'émission ouvert pour envoyer des trames. \
+                         Ce n'est pas un indicateur d'envoi récent.",
+                    );
+
+                    ui.separator();
+                    ui.label(format!("Trames: {}", self.data.len())).on_hover_text(format!(
+                        "Nombre de trames CAN en mémoire dans la liste (max {MESSAGES_COUNT}). \
+                         Vidé par CLEAR."
+                    ));
 
                     ui.separator();
                     if let Some(bus_load) = self.calc_bus_load() {
@@ -1320,8 +1336,7 @@ impl eframe::App for Gui {
         });
 
         self.viewer.message_row.format = self.format;
-        self.pinned_filters.message_row.format = self.format;
-        
+
         // Left side panel for message sender
         egui::SidePanel::left("message_sender_panel")
             .resizable(true)
@@ -1366,7 +1381,7 @@ impl eframe::App for Gui {
                 ui.separator();
                 
                 // Filter panel
-                let to_pin = self.filter_panel.update(ui);
+                self.filter_panel.update(ui);
                 if self.stopped != self.filter_panel.stop {
                     self.stopped = self.filter_panel.stop;
                     self.send_driver_control();
@@ -1376,14 +1391,8 @@ impl eframe::App for Gui {
                     self.data.clear();
                     self.bus_stats.reset();
                     self.bus_load_history.clear();
-                    self.pinned_filters.clear();
-                }
-                if let Some(to_pin) = to_pin {
-                    self.pinned_filters.pin_filter(to_pin, &self.data);
                 }
 
-                ui.separator();
-                self.pinned_filters.update(ui);
                 ui.separator();
                 self.viewer.update(ui, &self.data);
             });

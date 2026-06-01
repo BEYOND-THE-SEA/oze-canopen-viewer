@@ -23,15 +23,13 @@ impl FilterPanel {
         }
     }
 
-    pub fn update(&mut self, ui: &mut egui::Ui) -> Option<FilterDataPanel> {
-        let mut changed = false;
+    pub fn update(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui
                 .button(if self.stop { "START" } else { "STOP " })
                 .clicked()
             {
                 self.stop = !self.stop;
-                changed = true;
             }
 
             if ui.button("CLEAR").clicked() {
@@ -39,12 +37,10 @@ impl FilterPanel {
             }
 
             if ui.button("ALL").clicked() {
-                changed = true;
                 self.global_filter.borrow_mut().ignore_type = filter::Flags::NONE;
             }
 
             if ui.button("NONE").clicked() {
-                changed = true;
                 self.global_filter.borrow_mut().ignore_type = filter::Flags::ALL;
             }
 
@@ -53,7 +49,6 @@ impl FilterPanel {
                 let mut flag = (f & val) == val;
                 flag = !flag; // invert checkbox value
                 if ui.checkbox(&mut flag, name).changed() {
-                    changed = true;
                     if flag {
                         self.global_filter.borrow_mut().ignore_type.remove(val);
                     } else {
@@ -63,20 +58,8 @@ impl FilterPanel {
             }
         });
 
-        let mut to_add_fixed_filter: Option<FilterDataPanel> = None;
         ui.horizontal(|ui| {
-            changed |= self.data_panel.update(ui);
-            if ui
-                .button("➕")
-                .on_hover_text(
-                    "Pin new filter which will show only last filtered message in table below",
-                )
-                .clicked()
-            {
-                to_add_fixed_filter = Some(self.data_panel.clone());
-            }
+            self.data_panel.update(ui);
         });
-
-        to_add_fixed_filter
     }
 }
