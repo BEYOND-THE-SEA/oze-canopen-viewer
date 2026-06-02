@@ -12,6 +12,7 @@ use std::process::Stdio;
 use std::sync::Mutex;
 use tokio::process::Command;
 use tokio::io::AsyncWriteExt;
+use tokio::time::{timeout, Duration};
 
 /// Global storage for cleanup info (used by signal handlers)
 static CLEANUP_INFO: Mutex<Option<CleanupInfo>> = Mutex::new(None);
@@ -545,9 +546,10 @@ impl LocalCannelloniClient {
 
     /// Check if cannelloni client is already running for the specified remote
     pub async fn check_client_running(remote_host: &str) -> Result<bool, String> {
+        let _ = remote_host;
         let output = Command::new("pgrep")
             .arg("-f")
-            .arg(&format!("cannelloni.*vcan0.*{}", remote_host))
+            .arg("cannelloni.*-I vcan0.*-C c")
             .stderr(Stdio::piped())
             .stdout(Stdio::piped())
             .output()
@@ -601,11 +603,17 @@ impl LocalCannelloniClient {
             remote_host,
             port
         );
-        let bash_cmd = format!("{cmd} &");
+        // Use nohup to avoid the backgrounded client being terminated when the sudo shell exits.
+        // Logs are redirected for debugging when setup gets stuck.
+        let bash_cmd = format!("nohup {cmd} > /tmp/cannelloni-client.log 2>&1 &");
 
-        run_local_sudo(password, &["bash", "-c", &bash_cmd])
-            .await
-            .map_err(|e| format!("Failed to start cannelloni client: {}", e))?;
+        timeout(
+            Duration::from_secs(10),
+            run_local_sudo(password, &["bash", "-c", &bash_cmd]),
+        )
+        .await
+        .map_err(|_| "Timed out while starting local cannelloni client (sudo)".to_string())?
+        .map_err(|e| format!("Failed to start cannelloni client: {}", e))?;
 
         // Wait for client to connect
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -614,7 +622,7 @@ impl LocalCannelloniClient {
             log::info!("Cannelloni client started successfully");
             Ok(())
         } else {
-            Err("Cannelloni client failed to start or connect".to_string())
+            Err("Cannelloni client failed to start. Check /tmp/cannelloni-client.log".to_string())
         }
     }
 

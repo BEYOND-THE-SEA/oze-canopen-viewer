@@ -30,15 +30,20 @@ impl Viewer {
         // }
 
         let row_spacing = 3.0;
-        let column_spacing = 13.5;
+        let column_spacing = 5.0;
         let text_style = egui::TextStyle::Body;
         let text_height = ui.text_style_height(&text_style);
         let height = text_height + row_spacing;
-        egui::ScrollArea::vertical().animated(true).show_rows(
+        let table_width = ui.available_width();
+        egui::ScrollArea::vertical()
+            .animated(true)
+            .auto_shrink([false, false])
+            .show_rows(
             ui,
             height,
             data.len() + 1,
             |ui, row_range| {
+                ui.set_width(table_width);
                 egui::Grid::new("viewer_grid")
                     .start_row(row_range.start)
                     .spacing([column_spacing, row_spacing])
@@ -46,7 +51,7 @@ impl Viewer {
                     .min_row_height(height)
                     .show(ui, |ui| {
                         let data_range = if row_range.start == 0 {
-                            self.message_row.header(ui);
+                            self.message_row.header(ui, table_width, column_spacing);
                             ui.end_row();
                             0..(row_range.end - 1)
                         } else {
@@ -54,12 +59,12 @@ impl Viewer {
                         };
 
                         for d in data.range(data_range) {
-                            self.message_row.message(ui, d);
+                            self.message_row.message(ui, d, table_width, column_spacing);
                             ui.end_row();
                         }
 
                         // Костыль нужный, чтобы выровнять ширину столбца
-                        self.message_row.header(ui);
+                        self.message_row.header(ui, table_width, column_spacing);
                         ui.end_row();
                     });
             },

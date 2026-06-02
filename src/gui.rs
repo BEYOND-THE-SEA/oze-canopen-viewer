@@ -113,6 +113,7 @@ pub struct Gui {
     remote_setup_status: RemoteSetupStatus,
     is_remote_connected: bool,
     remote_status_receiver: Option<std_mpsc::Receiver<RemoteSetupStatus>>,
+    remote_starting_client_at: Option<Instant>,
     
     // UI toggles
     show_stats_panel: bool,
@@ -182,9 +183,34 @@ impl Gui {
             remote_setup_status: RemoteSetupStatus::Idle,
             is_remote_connected: false,
             remote_status_receiver: None,
+            remote_starting_client_at: None,
             // UI toggles
             show_stats_panel: false,
         }
+    }
+
+    fn apply_remote_connected_state(&mut self) {
+        self.is_remote_connected = true;
+
+        // Store cleanup info for signal handlers
+        CleanupInfo::store(CleanupInfo {
+            ssh_host: self.remote_ssh_host.clone(),
+            ssh_user: self.remote_ssh_user.clone(),
+            ssh_password: self.remote_ssh_password.clone(),
+            port: DEFAULT_CANNELLONI_PORT,
+        });
+
+        // Connect the viewer to vcan0
+        // Use selected bitrate for stats calculation (bus occupation)
+        self.connection.can_name = "vcan0".to_string();
+        self.connection.bitrate = self.selected_bitrate;
+        self.send_driver_control();
+        self.refresh_local_interface_details("vcan0");
+        self.refresh_remote_interface_details();
+
+        self.remote_setup_status = RemoteSetupStatus::Connected;
+        self.remote_starting_client_at = None;
+        self.remote_status_receiver = None;
     }
 
     fn send_driver_control(&self) {
@@ -381,6 +407,13 @@ impl Gui {
             || lowercase.contains("incorrect password")
             || lowercase.contains("sorry, try again")
             || lowercase.contains("authentication")
+    }
+
+    fn is_interface_missing_error(error: &str) -> bool {
+        let lowercase = error.to_lowercase();
+        lowercase.contains("cannot find device")
+            || lowercase.contains("no such device")
+            || lowercase.contains("does not exist")
     }
 
     fn query_local_interface_details(interface_name: &str) -> Option<InterfaceDetails> {
@@ -923,6 +956,26 @@ impl Gui {
                 self.refresh_local_interface_details(&can_name);
             }
             Err(e) => {
+                if Self::is_interface_missing_error(&e) {
+                    log::info!(
+                        "CAN interface {} is missing; treating as disconnected",
+                        self.can_name_raw
+                    );
+                    self.is_interface_up = false;
+
+                    // Remember local sudo password for future operations (e.g. remote vcan0)
+                    self.local_sudo_password = self.password_input.clone();
+
+                    // Close popup and clear password
+                    self.show_password_popup = false;
+                    self.password_input.clear();
+                    self.config_status = None;
+                    self.pending_action = None;
+                    let can_name = self.can_name_raw.clone();
+                    self.refresh_local_interface_details(&can_name);
+                    return;
+                }
+
                 log::error!("Failed to disconnect CAN interface: {}", e);
                 let needs_reauth = Self::is_sudo_auth_error(&e);
                 if needs_reauth {
@@ -1061,23 +1114,7 @@ impl Gui {
             
             match &status {
                 RemoteSetupStatus::Connected => {
-                    self.is_remote_connected = true;
-
-                    // Store cleanup info for signal handlers
-                    CleanupInfo::store(CleanupInfo {
-                        ssh_host: self.remote_ssh_host.clone(),
-                        ssh_user: self.remote_ssh_user.clone(),
-                        ssh_password: self.remote_ssh_password.clone(),
-                        port: DEFAULT_CANNELLONI_PORT,
-                    });
-
-                    // Connect the viewer to vcan0
-                    // Use selected bitrate for stats calculation (bus occupation)
-                    self.connection.can_name = "vcan0".to_string();
-                    self.connection.bitrate = self.selected_bitrate;
-                    self.send_driver_control();
-                    self.refresh_local_interface_details("vcan0");
-                    self.refresh_remote_interface_details();
+                    self.apply_remote_connected_state();
                 }
                 RemoteSetupStatus::Failed(msg) => {
                     self.is_remote_connected = false;
@@ -1086,6 +1123,10 @@ impl Gui {
                     if Self::is_sudo_auth_error(msg) {
                         self.local_sudo_password.clear();
                     }
+                    self.remote_starting_client_at = None;
+                }
+                RemoteSetupStatus::StartingClient => {
+                    self.remote_starting_client_at = Some(Instant::now());
                 }
                 _ => {}
             }
@@ -1096,6 +1137,47 @@ impl Gui {
         // Clear receiver if we got a final status
         if should_clear_receiver {
             self.remote_status_receiver = None;
+        }
+
+        // Watchdog: if we get stuck at "StartingClient" but the local client is running,
+        // treat the setup as connected to avoid UI getting stuck forever.
+        if !self.is_remote_connected
+            && self.remote_setup_status == RemoteSetupStatus::StartingClient
+        {
+            if let Some(started_at) = self.remote_starting_client_at {
+                if started_at.elapsed().as_secs_f32() > 2.0 {
+                    let remote_host = self.remote_ssh_host.clone();
+                    let port = DEFAULT_CANNELLONI_PORT;
+                    let rt = tokio::runtime::Handle::current();
+                    let client_running = rt.block_on(async {
+                        LocalCannelloniClient::check_client_running(&remote_host).await
+                    });
+                    match client_running {
+                        Ok(true) => {
+                            log::warn!(
+                                "Remote setup stuck at StartingClient, but cannelloni client is running; promoting to Connected"
+                            );
+                            // Best-effort: verify the remote port is reachable (non-fatal)
+                            let _ = rt.block_on(async {
+                                let remote = RemoteConnection::new(
+                                    self.remote_ssh_host.clone(),
+                                    self.remote_ssh_user.clone(),
+                                    self.remote_ssh_password.clone(),
+                                    self.remote_can_interface.clone(),
+                                    self.selected_bitrate,
+                                    port,
+                                );
+                                remote.check_cannelloni_server_running().await
+                            });
+                            self.apply_remote_connected_state();
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            log::debug!("Failed to check cannelloni client: {}", e);
+                        }
+                    }
+                }
+            }
         }
     }
 
