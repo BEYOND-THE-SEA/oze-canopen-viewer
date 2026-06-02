@@ -185,45 +185,45 @@ impl Driver {
             WriteCommand::ConfigureTpdo1Statusword { node_id } => {
                 log::info!("Configuring TPDO1 for Statusword (0x6041) on node {}", node_id);
                 
-                // Étape 1: NMT Pre-Operational
+                // Step 1: NMT Pre-Operational
                 let nmt_pre_op = NmtCommand::new(NmtCommandSpecifier::EnterPreOperational, node_id);
                 if let Err(e) = self.co.send_nmt(nmt_pre_op).await {
                     log::error!("Failed to send NMT Pre-Operational: {:?}", e);
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 
-                // Étape 2: Désactiver TPDO1 (COB-ID avec bit 31 = 1)
+                // Step 2: Disable TPDO1 (COB-ID with bit 31 = 1)
                 let cob_id_disabled = 0x80000180u32 + u32::from(node_id);
                 self.send_sdo_download(node_id, 0x1800, 0x01, &cob_id_disabled.to_le_bytes().to_vec()).await;
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 
-                // Étape 3: Effacer le mapping (mettre le nombre d'objets à 0)
+                // Step 3: Clear mapping (set mapped object count to 0)
                 self.send_sdo_download(node_id, 0x1A00, 0x00, &[0x00]).await;
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 
-                // Étape 4: Configurer le mapping pour Statusword (0x6041, 32 bits)
-                // Format: 0xIIIISSLL (Index + Subindex + Length en bits)
+                // Step 4: Configure mapping for Statusword (0x6041, 32 bits)
+                // Format: 0xIIIISSLL (Index + Subindex + Length in bits)
                 let mapping: u32 = 0x60410020; // 0x6041 subindex 0x00, 32 bits (0x20)
                 self.send_sdo_download(node_id, 0x1A00, 0x01, &mapping.to_le_bytes().to_vec()).await;
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 
-                // Étape 5: Activer le mapping (1 objet mappé)
+                // Step 5: Enable mapping (1 mapped object)
                 self.send_sdo_download(node_id, 0x1A00, 0x00, &[0x01]).await;
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 
-                // Étape 6: Activer TPDO1 (COB-ID sans bit 31)
+                // Step 6: Enable TPDO1 (COB-ID without bit 31)
                 let cob_id_enabled = 0x00000180u32 + u32::from(node_id);
                 self.send_sdo_download(node_id, 0x1800, 0x01, &cob_id_enabled.to_le_bytes().to_vec()).await;
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 
-                // Étape 7: NMT Operational
+                // Step 7: NMT Operational
                 let nmt_op = NmtCommand::new(NmtCommandSpecifier::StartRemoteNode, node_id);
                 if let Err(e) = self.co.send_nmt(nmt_op).await {
                     log::error!("Failed to send NMT Operational: {:?}", e);
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 
-                // Étape 8: Configurer le type de transmission (0x01 = SYNC cyclique à chaque SYNC)
+                // Step 8: Configure transmission type (0x01 = cyclic SYNC on every SYNC)
                 self.send_sdo_download(node_id, 0x1800, 0x02, &[0x01]).await;
                 
                 log::info!("TPDO1 configured successfully for node {}", node_id);

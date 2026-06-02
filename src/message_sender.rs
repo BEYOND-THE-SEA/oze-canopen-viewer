@@ -369,7 +369,7 @@ impl MessageSender {
     }
     
     fn show_pdo_config_ui(&mut self, ui: &mut Ui) {
-        ui.label("🔧 Configuration PDO automatique");
+        ui.label("🔧 Automatic PDO configuration");
         ui.separator();
         
         ui.horizontal(|ui| {
@@ -382,14 +382,14 @@ impl MessageSender {
         ui.separator();
         
         ui.heading("TPDO1 → Statusword on SYNC");
-        ui.label("Configure automatiquement TPDO1 pour envoyer:");
-        ui.label("• Statusword (0x6041) à chaque message SYNC");
+        ui.label("Automatically configures TPDO1 to send:");
+        ui.label("• Statusword (0x6041) on every SYNC message");
         ui.label("• COB-ID: 0x180 + Node ID");
-        ui.label("• Type de transmission: 0x01 (SYNC cyclique chaque SYNC)");
+        ui.label("• Transmission type: 0x01 (cyclic SYNC on every SYNC)");
         
         ui.separator();
         
-        ui.label("ℹ️ Séquence correcte envoyée:");
+        ui.label("ℹ️ Correct sequence sent:");
         ui.label("1. NMT Pre-Operational");
         ui.label("2. Disable TPDO1 (0x1800:01)");
         ui.label("3. Clear Mapping (0x1A00:00 = 0)");
@@ -401,12 +401,12 @@ impl MessageSender {
         
         ui.separator();
         
-        if ui.button("🚀 Configurer TPDO1 Statusword").clicked() {
+        if ui.button("🚀 Configure TPDO1 Statusword").clicked() {
             if let Ok(node_id) = self.pdo_config_node_id.parse::<u8>() {
                 let _ = self.write_sender.try_send(WriteCommand::ConfigureTpdo1Statusword {
                     node_id,
                 });
-                log::info!("Configuration TPDO1 lancée pour le node {}", node_id);
+                log::info!("TPDO1 configuration started for node {}", node_id);
             } else {
                 log::error!("Invalid node ID format");
             }

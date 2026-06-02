@@ -77,22 +77,22 @@ impl MessageRow {
 
     fn header_cell(ui: &mut egui::Ui, width: f32, text: &str) {
         let h = ui.spacing().interact_size.y;
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::hover());
-        ui.painter().text(
-            rect.left_center(),
-            egui::Align2::LEFT_CENTER,
-            text,
-            egui::TextStyle::Body.resolve(ui.style()),
-            ui.visuals().text_color(),
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, h),
+            Layout::top_down(Align::LEFT),
+            |ui| {
+                ui.label(text);
+            },
         );
     }
 
     fn data_cell(ui: &mut egui::Ui, width: f32, add_label: impl FnOnce(&mut egui::Ui)) {
         let h = ui.spacing().interact_size.y;
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::hover());
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
-            ui.with_layout(Layout::top_down(Align::LEFT), add_label);
-        });
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, h),
+            Layout::top_down(Align::LEFT),
+            add_label,
+        );
     }
 
     fn data_label(ui: &mut egui::Ui, width: f32, text: impl Into<egui::WidgetText>) {

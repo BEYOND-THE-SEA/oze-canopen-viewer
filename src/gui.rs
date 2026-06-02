@@ -7,6 +7,7 @@ use crate::{
     filter_panel::FilterPanel,
     message_cached::MessageCached,
     message_sender::MessageSender,
+    node_scan::NodeScan,
     remote_connection::{CleanupInfo, LocalCannelloniClient, RemoteConnection, RemoteSetupStatus, DEFAULT_CANNELLONI_PORT},
     theme::{theme, OZON_GRAY, OZON_PINK},
     viewer::Viewer,
@@ -21,6 +22,7 @@ use tokio::{
     sync::{watch, mpsc, Mutex},
     time::Instant,
 };
+use tokio::time::Duration;
 
 const MESSAGES_COUNT: usize = 4096;
 
@@ -73,6 +75,10 @@ pub struct Gui {
     global_filter: Rc<RefCell<GlobalFilter>>,
     filter_panel: FilterPanel,
     message_sender: MessageSender,
+    node_scan: NodeScan,
+    active_scan_running: bool,
+    active_scan_started_at: Option<Instant>,
+    active_scan_expected_end_at: Option<Instant>,
 
     format: RxMessageToStringFormat,
 
@@ -155,6 +161,10 @@ impl Gui {
             viewer: Viewer::new(global_filter.clone()),
             filter_panel: FilterPanel::new(global_filter.clone()),
             message_sender: MessageSender::new(write_sender.clone()),
+            node_scan: NodeScan::default(),
+            active_scan_running: false,
+            active_scan_started_at: None,
+            active_scan_expected_end_at: None,
             last: Instant::now(),
             chart: Chart::new(bitrate.clone()),
             stopped: false,
@@ -241,6 +251,9 @@ impl Gui {
 
             // Update bus statistics
             self.bus_stats.on_message(i.msg.msg.cob_id, now);
+
+            // Passive node scan should not depend on UI filters
+            self.node_scan.update_from_message(i);
             
             if !self.global_filter.borrow().filter(i) {
                 self.data.push_front(i.clone());
@@ -288,15 +301,15 @@ impl Gui {
                 let percentage = (current_bps / f64::from(configured_bitrate)) * 100.0;
                 let clamped_percentage = percentage.min(100.0).max(0.0);
                 
-                // Ajouter à l'historique
+                // Add to history
                 self.bus_load_history.push_back(clamped_percentage);
                 
-                // Garder une fenêtre glissante de 50 échantillons
+                // Keep a sliding window of 50 samples
                 while self.bus_load_history.len() > 50 {
                     self.bus_load_history.pop_front();
                 }
                 
-                // Calculer la moyenne glissante
+                // Calculate sliding average
                 if !self.bus_load_history.is_empty() {
                     let avg = self.bus_load_history.iter().sum::<f64>() / self.bus_load_history.len() as f64;
                     
@@ -311,7 +324,7 @@ impl Gui {
     }
     
     
-    fn show_stats_content(&self, ui: &mut Ui) {
+    fn show_stats_content(&mut self, ui: &mut Ui) {
         ui.vertical(|ui| {
             
             // Top COB-IDs
@@ -342,7 +355,83 @@ impl Gui {
             }
             
             ui.separator();
+
+            // Observed nodes + active scan
+            ui.horizontal(|ui| {
+                ui.label("🧭 Observed nodes:");
+
+                if self.active_scan_running {
+                    ui.separator();
+                    ui.weak("Bus scan running...");
+                }
+
+                ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                    let scan_btn = ui.add_enabled(!self.active_scan_running, Button::new("Scan bus"));
+                    if scan_btn
+                        .on_hover_text("Sends SDO requests (0x1000/0x1018) to discover silent nodes")
+                        .clicked()
+                    {
+                        self.start_active_scan();
+                    }
+                });
+            });
+
+            // Stop scan when expected time passed (best-effort).
+            if self.active_scan_running {
+                if let Some(end_at) = self.active_scan_expected_end_at {
+                    if Instant::now() >= end_at {
+                        self.active_scan_running = false;
+                        self.active_scan_started_at = None;
+                        self.active_scan_expected_end_at = None;
+                    }
+                }
+            }
+
+            egui::Grid::new("observed_nodes")
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("Node ID");
+                    ui.label("Frames");
+                    ui.label("Last seen");
+                    ui.label("Types");
+                    ui.label("State");
+                    ui.label("Profile");
+                    ui.label("Vendor");
+                    ui.label("Product");
+                    ui.end_row();
+
+                    let now = Instant::now();
+                    let mut any = false;
+                    for n in self.node_scan.values() {
+                        any = true;
+                        ui.monospace(format!("{}", n.node_id));
+                        ui.monospace(format!("{}", n.frames));
+                        let last_seen = n.last_seen.map(|t| now.duration_since(t).as_secs_f32());
+                        if let Some(s) = last_seen {
+                            ui.monospace(format!("{s:.1}s"));
+                        } else {
+                            ui.monospace("-");
+                        }
+                        ui.label(n.types_string());
+                        ui.label(
+                            n.heartbeat_state
+                                .map(|s| s.as_str().to_string())
+                                .unwrap_or_else(|| "-".to_string()),
+                        );
+                        ui.label(n.profile_string());
+                        ui.label(n.vendor_string());
+                        ui.monospace(n.product_string());
+                        ui.end_row();
+                    }
+
+                    if !any {
+                        ui.weak("No nodes observed yet");
+                        ui.end_row();
+                    }
+                });
             
+            ui.separator();
+
             // Bus occupation details
             ui.label("🔋 Bus Occupation Details:");
             ui.separator();
@@ -377,6 +466,51 @@ impl Gui {
             ui.label(format!("• Peak: {:.1} msg/s", self.bus_stats.peak_msg_rate()));
             ui.label(format!("• Average: {:.2} msg/s", self.bus_stats.avg_msg_rate()));
             ui.label(format!("• Total: {}", self.bus_stats.total_messages()));
+        });
+    }
+
+    fn start_active_scan(&mut self) {
+        const THROTTLE_MS: u64 = 8;
+        const NODES: u64 = 127;
+        const REQS_PER_NODE: u64 = 5; // 0x1000:00 and 0x1018:01..04
+        let total_reqs = NODES * REQS_PER_NODE;
+        let estimated_ms = total_reqs * THROTTLE_MS + 500;
+
+        self.node_scan.clear();
+        self.active_scan_running = true;
+        let started_at = Instant::now();
+        self.active_scan_started_at = Some(started_at);
+        self.active_scan_expected_end_at = Some(started_at + Duration::from_millis(estimated_ms));
+
+        let sender = self.write_sender.clone();
+        tokio::spawn(async move {
+            for node_id in 1u8..=127u8 {
+                let cob_id = 0x600u32 + u32::from(node_id);
+                let requests: &[(u16, u8)] = &[
+                    (0x1000, 0x00),
+                    (0x1018, 0x01),
+                    (0x1018, 0x02),
+                    (0x1018, 0x03),
+                    (0x1018, 0x04),
+                ];
+
+                for (index, sub) in requests {
+                    let data = vec![
+                        0x40,
+                        (*index & 0x00FF) as u8,
+                        (*index >> 8) as u8,
+                        *sub,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ];
+                    let _ = sender
+                        .send(WriteCommand::SendRaw { cob_id, data })
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(THROTTLE_MS)).await;
+                }
+            }
         });
     }
 
@@ -738,7 +872,7 @@ impl Gui {
         let ssh_host_response = ui.add_enabled(
             !self.is_remote_connected && !is_connecting,
             TextEdit::singleline(&mut self.remote_ssh_host)
-                .hint_text("Host (IP ou nom)")
+                .hint_text("Host (IP or name)")
                 .desired_width(160.0),
         ).on_hover_text("IP address or hostname of the remote machine (e.g., 192.168.0.166 or pc-bts3.local)");
 
@@ -1358,31 +1492,31 @@ impl eframe::App for Gui {
                     ui.separator();
 
                     let rx_state = if self.info.receiver_socket {
-                        "actif"
+                        "active"
                     } else {
-                        "inactif"
+                        "inactive"
                     };
                     ui.label(format!("CAN rx: {rx_state}")).on_hover_text(
-                        "Socket CAN de réception ouvert ; « actif » après au moins une trame lue. \
-                         Ce n'est pas un compteur de messages.",
+                        "CAN receive socket is open; active after at least one frame was read. \
+                         This is not a message counter.",
                     );
 
                     ui.separator();
 
                     let tx_state = if self.info.transmitter_socket {
-                        "actif"
+                        "active"
                     } else {
-                        "inactif"
+                        "inactive"
                     };
                     ui.label(format!("CAN tx: {tx_state}")).on_hover_text(
-                        "Socket CAN d'émission ouvert pour envoyer des trames. \
-                         Ce n'est pas un indicateur d'envoi récent.",
+                        "CAN transmit socket is open for sending frames. \
+                         This is not a recent-send indicator.",
                     );
 
                     ui.separator();
-                    ui.label(format!("Trames: {}", self.data.len())).on_hover_text(format!(
-                        "Nombre de trames CAN en mémoire dans la liste (max {MESSAGES_COUNT}). \
-                         Vidé par CLEAR."
+                    ui.label(format!("Frames: {}", self.data.len())).on_hover_text(format!(
+                        "Number of CAN frames kept in the list (max {MESSAGES_COUNT}). \
+                         Cleared by CLEAR."
                     ));
 
                     ui.separator();
@@ -1401,7 +1535,7 @@ impl eframe::App for Gui {
                         ui.label(format!("{fps} FPS",));
                         ui.separator();
                         if ui.selectable_label(self.show_stats_panel, "📈")
-                            .on_hover_text(if self.show_stats_panel { "Masquer les statistiques" } else { "Afficher les statistiques" })
+                            .on_hover_text(if self.show_stats_panel { "Hide statistics" } else { "Show statistics" })
                             .clicked()
                         {
                             self.show_stats_panel = !self.show_stats_panel;
@@ -1442,7 +1576,7 @@ impl eframe::App for Gui {
                     ui.horizontal(|ui| {
                         ui.heading("📈 Stats");
                         ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("✖").on_hover_text("Masquer les statistiques").clicked() {
+                            if ui.button("✖").on_hover_text("Hide statistics").clicked() {
                                 self.show_stats_panel = false;
                             }
                         });
@@ -1473,6 +1607,7 @@ impl eframe::App for Gui {
                     self.data.clear();
                     self.bus_stats.reset();
                     self.bus_load_history.clear();
+                    self.node_scan.clear();
                 }
 
                 ui.separator();
