@@ -9,6 +9,8 @@ pub mod gui;
 pub mod message_cached;
 pub mod message_row;
 pub mod message_sender;
+pub mod node_config;
+pub mod node_config_panel;
 pub mod node_scan;
 pub mod vendor_ids;
 pub mod remote_connection;

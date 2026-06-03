@@ -29,6 +29,10 @@ pub enum WriteCommand {
     SendPdo { cob_id: u32, data: Vec<u8> },
     /// Send an SDO Download (write to object dictionary)
     SendSdoDownload { node_id: u8, index: u16, subindex: u8, data: Vec<u8> },
+    /// Send an SDO Upload request (read expedited, ≤4 bytes)
+    SendSdoUpload { node_id: u8, index: u16, subindex: u8 },
+    /// Send a Layer Setting Service command on COB-ID 0x7E5
+    SendLssCommand { command: u8, data: Vec<u8> },
     /// Configure TPDO1 for Statusword on SYNC
     ConfigureTpdo1Statusword { node_id: u8 },
 }
@@ -182,6 +186,12 @@ impl Driver {
             WriteCommand::SendSdoDownload { node_id, index, subindex, data } => {
                 self.send_sdo_download(node_id, index, subindex, &data).await;
             }
+            WriteCommand::SendSdoUpload { node_id, index, subindex } => {
+                self.send_sdo_upload(node_id, index, subindex).await;
+            }
+            WriteCommand::SendLssCommand { command, data } => {
+                self.send_lss_command(command, &data).await;
+            }
             WriteCommand::ConfigureTpdo1Statusword { node_id } => {
                 log::info!("Configuring TPDO1 for Statusword (0x6041) on node {}", node_id);
                 
@@ -260,6 +270,42 @@ impl Driver {
         } else {
             log::info!("SDO Download sent to node {}: index=0x{:04X}, subindex=0x{:02X}, data={:02X?}", 
                 node_id, index, subindex, data);
+        }
+    }
+
+    async fn send_sdo_upload(&mut self, node_id: u8, index: u16, subindex: u8) {
+        let cob_id = 0x600 + u16::from(node_id);
+        let data = vec![
+            0x40,
+            (index & 0x00FF) as u8,
+            (index >> 8) as u8,
+            subindex,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let packet = TxPacket { cob_id, data };
+        if let Err(e) = self.co.tx.send(packet).await {
+            log::error!("Failed to send SDO Upload: {:?}", e);
+        } else {
+            log::info!(
+                "SDO Upload sent to node {node_id}: index=0x{index:04X}, subindex=0x{subindex:02X}"
+            );
+        }
+    }
+
+    async fn send_lss_command(&mut self, command: u8, data: &[u8]) {
+        let cob_id = 0x7E5u16;
+        let mut msg = vec![0u8; 8];
+        msg[0] = command;
+        let copy_len = data.len().min(7);
+        msg[1..1 + copy_len].copy_from_slice(&data[..copy_len]);
+        let packet = TxPacket { cob_id, data: msg };
+        if let Err(e) = self.co.tx.send(packet).await {
+            log::error!("Failed to send LSS command: {:?}", e);
+        } else {
+            log::info!("LSS command 0x{command:02X} sent, data={data:02X?}");
         }
     }
 

@@ -54,6 +54,8 @@ pub struct ObservedNode {
     pub types_mask: u16,
     pub heartbeat_state: Option<NmtState>,
     pub identity: NodeIdentity,
+    /// Host CAN bitrates at which this node was seen (boot-up scan or traffic).
+    pub detected_bitrates: Vec<u32>,
 }
 
 impl ObservedNode {
@@ -121,6 +123,47 @@ impl ObservedNode {
             "-".to_string()
         }
     }
+
+    pub fn detected_bitrates_string(&self) -> String {
+        if self.detected_bitrates.is_empty() {
+            return "-".to_string();
+        }
+        self.detected_bitrates
+            .iter()
+            .map(|bps| format_bitrate_short(*bps))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    pub fn selection_label(&self) -> String {
+        format!(
+            "Node {} — {} — {}",
+            self.node_id,
+            self.vendor_string(),
+            self.profile_string()
+        )
+    }
+}
+
+fn format_bitrate_short(bps: u32) -> String {
+    if bps >= 1_000_000 {
+        format!("{}M", bps / 1_000_000)
+    } else if bps >= 1000 {
+        format!("{}k", bps / 1000)
+    } else {
+        format!("{bps}")
+    }
+}
+
+/// COB-ID 0x700 + node_id (boot-up / heartbeat).
+pub fn node_id_from_heartbeat_cob(cob_id: u16) -> Option<u8> {
+    if (0x700..=0x77F).contains(&cob_id) {
+        let nid = cob_id - 0x700;
+        if (1..=127).contains(&nid) {
+            return Some(nid as u8);
+        }
+    }
+    None
 }
 
 #[derive(Debug, Default)]
@@ -133,8 +176,42 @@ impl NodeScan {
         self.nodes.clear();
     }
 
+    pub fn node_ids_sorted(&self) -> Vec<u8> {
+        self.nodes.keys().copied().collect()
+    }
+
     pub fn values(&self) -> impl Iterator<Item = &ObservedNode> {
         self.nodes.values()
+    }
+
+    pub fn get(&self, node_id: u8) -> Option<&ObservedNode> {
+        self.nodes.get(&node_id)
+    }
+
+    pub fn mark_detected_at_bitrate(&mut self, node_id: u8, bitrate: u32) {
+        let entry = self.nodes.entry(node_id).or_insert_with(|| ObservedNode {
+            node_id,
+            ..ObservedNode::default()
+        });
+        if !entry.detected_bitrates.contains(&bitrate) {
+            entry.detected_bitrates.push(bitrate);
+            entry.detected_bitrates.sort_unstable();
+        }
+    }
+
+    /// Record boot-up / heartbeat on 0x700+n while scanning at `bitrate`.
+    pub fn observe_bootup_frame(&mut self, cob_id: u16, bitrate: u32, nmt_state: Option<NmtState>) {
+        let Some(node_id) = node_id_from_heartbeat_cob(cob_id) else {
+            return;
+        };
+        self.mark_detected_at_bitrate(node_id, bitrate);
+        if let Some(entry) = self.nodes.get_mut(&node_id) {
+            entry.last_cob_id = Some(cob_id);
+            if let Some(state) = nmt_state {
+                entry.heartbeat_state = Some(state);
+            }
+            entry.mark_type(RxMessageType::Guarding);
+        }
     }
 
     pub fn update_from_message(&mut self, msg: &MessageCached) {
@@ -155,6 +232,16 @@ impl NodeScan {
         entry.last_seen = Some(msg.get_timestamp());
         entry.last_cob_id = Some(msg.msg.msg.cob_id);
         entry.mark_type(msg.msg.parsed_type);
+
+        if let Some(nid) = node_id_from_heartbeat_cob(msg.msg.msg.cob_id) {
+            if nid == node_id {
+                if let RxMessageAdditional::Heartbeat(hb) = &msg.additional {
+                    if hb.state == NmtState::BootUp {
+                        entry.mark_type(RxMessageType::Guarding);
+                    }
+                }
+            }
+        }
 
         match &msg.additional {
             RxMessageAdditional::Heartbeat(hb) => {

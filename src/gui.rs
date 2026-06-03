@@ -5,9 +5,11 @@ use crate::{
     driver::{Control, ControlCommand, State, WriteCommand},
     filter::GlobalFilter,
     filter_panel::FilterPanel,
-    message_cached::MessageCached,
+    message_cached::{MessageCached, RxMessageAdditional},
     message_sender::MessageSender,
-    node_scan::NodeScan,
+    node_config::CLI_BITRATES,
+    node_config_panel::NodeConfigPanel,
+    node_scan::{node_id_from_heartbeat_cob, NodeScan},
     remote_connection::{CleanupInfo, LocalCannelloniClient, RemoteConnection, RemoteSetupStatus, DEFAULT_CANNELLONI_PORT},
     theme::{theme, OZON_GRAY, OZON_PINK},
     viewer::Viewer,
@@ -16,14 +18,13 @@ use egui::{emath::Numeric, Button, Layout, TextEdit, Ui};
 use oze_canopen::{
     canopen::RxMessageToStringFormat,
     interface::{CanOpenInfo, Connection},
+    proto::nmt::NmtCommandSpecifier,
 };
 use std::{cell::RefCell, collections::VecDeque, io::Write, process::{Command, Stdio}, rc::Rc, sync::Arc, sync::mpsc as std_mpsc};
 use tokio::{
     sync::{watch, mpsc, Mutex},
     time::Instant,
 };
-use tokio::time::Duration;
-
 const MESSAGES_COUNT: usize = 4096;
 
 /// Standard CANopen bitrates
@@ -76,9 +77,7 @@ pub struct Gui {
     filter_panel: FilterPanel,
     message_sender: MessageSender,
     node_scan: NodeScan,
-    active_scan_running: bool,
-    active_scan_started_at: Option<Instant>,
-    active_scan_expected_end_at: Option<Instant>,
+    node_config_panel: NodeConfigPanel,
 
     format: RxMessageToStringFormat,
 
@@ -123,6 +122,31 @@ pub struct Gui {
     
     // UI toggles
     show_stats_panel: bool,
+
+    multi_bitrate_scan: Option<MultiBitrateScan>,
+}
+
+#[derive(Debug)]
+struct MultiBitrateScan {
+    restore_bitrate: u32,
+    bitrates: Vec<u32>,
+    index: usize,
+    phase: MultiBitratePhase,
+    deadline: Instant,
+    current_bps: u32,
+    nodes_found_this_step: Vec<u8>,
+    probe_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultiBitratePhase {
+    SetHostBitrate,
+    WaitLink,
+    NmtBroadcast,
+    Listen,
+    SdoProbe,
+    RestoreHostBitrate,
+    Done,
 }
 
 impl Gui {
@@ -162,9 +186,7 @@ impl Gui {
             filter_panel: FilterPanel::new(global_filter.clone()),
             message_sender: MessageSender::new(write_sender.clone()),
             node_scan: NodeScan::default(),
-            active_scan_running: false,
-            active_scan_started_at: None,
-            active_scan_expected_end_at: None,
+            node_config_panel: NodeConfigPanel::default(),
             last: Instant::now(),
             chart: Chart::new(bitrate.clone()),
             stopped: false,
@@ -196,7 +218,206 @@ impl Gui {
             remote_starting_client_at: None,
             // UI toggles
             show_stats_panel: false,
+            multi_bitrate_scan: None,
         }
+    }
+
+    pub fn bootup_listen_bitrate(&self) -> Option<u32> {
+        match &self.multi_bitrate_scan {
+            Some(s) if s.phase == MultiBitratePhase::Listen => Some(s.current_bps),
+            _ => None,
+        }
+    }
+
+    fn begin_multi_bitrate_scan(&mut self) {
+        if self.connection_mode != ConnectionMode::Local || !self.is_interface_up {
+            self.node_config_panel
+                .push_log("Scan all bitrates: local CAN connection required".to_string());
+            return;
+        }
+        if self.local_sudo_password.is_empty() {
+            self.node_config_panel.push_log(
+                "Scan all bitrates: connect once with sudo password saved".to_string(),
+            );
+            return;
+        }
+
+        let restore = self.selected_bitrate.unwrap_or(250_000);
+        self.node_scan.clear();
+        self.node_config_panel.push_log(format!(
+            "Multi-bitrate scan started (restore {restore} bit/s after)"
+        ));
+
+        self.multi_bitrate_scan = Some(MultiBitrateScan {
+            restore_bitrate: restore,
+            bitrates: CLI_BITRATES.iter().map(|(b, _)| *b).collect(),
+            index: 0,
+            phase: MultiBitratePhase::SetHostBitrate,
+            deadline: Instant::now(),
+            current_bps: CLI_BITRATES[0].0,
+            nodes_found_this_step: Vec::new(),
+            probe_index: 0,
+        });
+        self.node_config_panel.multi_bitrate_status =
+            Some("Preparing multi-bitrate scan...".to_string());
+    }
+
+    fn poll_multi_bitrate_scan(&mut self) {
+        let Some(mut scan) = self.multi_bitrate_scan.take() else {
+            return;
+        };
+
+        if scan.phase == MultiBitratePhase::Done {
+            self.node_config_panel.multi_bitrate_status = None;
+            return;
+        }
+
+        let now = Instant::now();
+        if now < scan.deadline {
+            self.multi_bitrate_scan = Some(scan);
+            return;
+        }
+
+        match scan.phase {
+            MultiBitratePhase::SetHostBitrate => {
+                let bps = scan.bitrates[scan.index];
+                scan.current_bps = bps;
+                let label = format_bitrate_label(bps);
+                self.node_config_panel.multi_bitrate_status = Some(format!(
+                    "Scanning {label} ({}/{}) — setting host bitrate...",
+                    scan.index + 1,
+                    scan.bitrates.len()
+                ));
+                let can_name = self.can_name_raw.clone();
+                let password = self.local_sudo_password.clone();
+                match Self::configure_can_interface(&can_name, Some(bps), &password) {
+                    Ok(()) => {
+                        self.selected_bitrate = Some(bps);
+                        self.connection.bitrate = Some(bps);
+                        self.send_driver_control();
+                        scan.phase = MultiBitratePhase::WaitLink;
+                        scan.deadline = now + std::time::Duration::from_millis(400);
+                        self.node_config_panel
+                            .push_log(format!("Host CAN set to {label}"));
+                    }
+                    Err(e) => {
+                        self.node_config_panel
+                            .push_log(format!("Failed to set {label}: {e}"));
+                        scan.index += 1;
+                        scan.phase = if scan.index >= scan.bitrates.len() {
+                            MultiBitratePhase::RestoreHostBitrate
+                        } else {
+                            MultiBitratePhase::SetHostBitrate
+                        };
+                        scan.deadline = now;
+                    }
+                }
+            }
+            MultiBitratePhase::WaitLink => {
+                scan.phase = MultiBitratePhase::NmtBroadcast;
+                scan.deadline = now;
+            }
+            MultiBitratePhase::NmtBroadcast => {
+                let _ = self.write_sender.try_send(WriteCommand::SendNmt {
+                    node_id: 0,
+                    command: NmtCommandSpecifier::ResetNode,
+                });
+                scan.nodes_found_this_step.clear();
+                scan.phase = MultiBitratePhase::Listen;
+                scan.deadline = now + std::time::Duration::from_millis(1000);
+                self.node_config_panel.push_log(format!(
+                    "NMT ResetNode @ {} — listening for boot-up",
+                    format_bitrate_label(scan.current_bps)
+                ));
+            }
+            MultiBitratePhase::Listen => {
+                let current_bps = scan.current_bps;
+                let found: Vec<u8> = self
+                    .node_scan
+                    .node_ids_sorted()
+                    .into_iter()
+                    .filter(|id| {
+                        self.node_scan
+                            .get(*id)
+                            .map(|n| n.detected_bitrates.contains(&current_bps))
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                scan.nodes_found_this_step = found.clone();
+                self.node_config_panel.push_log(format!(
+                    "{}: {} node(s) detected",
+                    format_bitrate_label(current_bps),
+                    found.len()
+                ));
+                if found.is_empty() {
+                    scan.index += 1;
+                    scan.phase = if scan.index >= scan.bitrates.len() {
+                        MultiBitratePhase::RestoreHostBitrate
+                    } else {
+                        MultiBitratePhase::SetHostBitrate
+                    };
+                    scan.deadline = now;
+                } else {
+                    scan.probe_index = 0;
+                    scan.phase = MultiBitratePhase::SdoProbe;
+                    scan.deadline = now + std::time::Duration::from_millis(50);
+                }
+            }
+            MultiBitratePhase::SdoProbe => {
+                if scan.probe_index < scan.nodes_found_this_step.len() {
+                    let node_id = scan.nodes_found_this_step[scan.probe_index];
+                    let sender = self.write_sender.clone();
+                    for (index, sub) in [(0x1018u16, 1u8), (0x1000, 0)] {
+                        let _ = sender.try_send(WriteCommand::SendSdoUpload {
+                            node_id,
+                            index,
+                            subindex: sub,
+                        });
+                    }
+                    scan.probe_index += 1;
+                    scan.deadline = now + std::time::Duration::from_millis(80);
+                } else {
+                    scan.index += 1;
+                    scan.phase = if scan.index >= scan.bitrates.len() {
+                        MultiBitratePhase::RestoreHostBitrate
+                    } else {
+                        MultiBitratePhase::SetHostBitrate
+                    };
+                    scan.deadline = now + std::time::Duration::from_millis(200);
+                }
+            }
+            MultiBitratePhase::RestoreHostBitrate => {
+                let restore = scan.restore_bitrate;
+                let can_name = self.can_name_raw.clone();
+                let password = self.local_sudo_password.clone();
+                match Self::configure_can_interface(&can_name, Some(restore), &password) {
+                    Ok(()) => {
+                        self.selected_bitrate = Some(restore);
+                        self.connection.bitrate = Some(restore);
+                        self.send_driver_control();
+                        self.node_config_panel.push_log(format!(
+                            "Host CAN restored to {} bit/s",
+                            format_bitrate_label(restore)
+                        ));
+                    }
+                    Err(e) => {
+                        self.node_config_panel
+                            .push_log(format!("Failed to restore host bitrate: {e}"));
+                    }
+                }
+                let ids = self.node_scan.node_ids_sorted();
+                if ids.len() == 1 {
+                    self.node_config_panel.selected_node_id = Some(ids[0]);
+                }
+                self.node_config_panel
+                    .push_log("Multi-bitrate scan finished".to_string());
+                self.node_config_panel.multi_bitrate_status = None;
+                return;
+            }
+            MultiBitratePhase::Done => {}
+        }
+
+        self.multi_bitrate_scan = Some(scan);
     }
 
     fn apply_remote_connected_state(&mut self) {
@@ -237,6 +458,7 @@ impl Gui {
     fn get_data_from_driver(&mut self) -> bool {
         let driver = self.driver.borrow();
         let now = Instant::now();
+        let mut new_messages = Vec::new();
         
         for i in &driver.data {
             // Use last_seen_index to filter already processed messages
@@ -254,10 +476,26 @@ impl Gui {
 
             // Passive node scan should not depend on UI filters
             self.node_scan.update_from_message(i);
+
+            if let Some(bps) = self.bootup_listen_bitrate() {
+                if let Some(_nid) = node_id_from_heartbeat_cob(i.msg.msg.cob_id) {
+                    let hb_state = match &i.additional {
+                        RxMessageAdditional::Heartbeat(hb) => Some(hb.state),
+                        _ => None,
+                    };
+                    self.node_scan.observe_bootup_frame(i.msg.msg.cob_id, bps, hb_state);
+                }
+            }
+
+            new_messages.push(i.clone());
             
             if !self.global_filter.borrow().filter(i) {
                 self.data.push_front(i.clone());
             }
+        }
+
+        if !new_messages.is_empty() {
+            self.node_config_panel.on_messages(&new_messages);
         }
 
         while self.data.len() > MESSAGES_COUNT {
@@ -356,82 +594,6 @@ impl Gui {
             
             ui.separator();
 
-            // Observed nodes + active scan
-            ui.horizontal(|ui| {
-                ui.label("🧭 Observed nodes:");
-
-                if self.active_scan_running {
-                    ui.separator();
-                    ui.weak("Bus scan running...");
-                }
-
-                ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                    let scan_btn = ui.add_enabled(!self.active_scan_running, Button::new("Scan bus"));
-                    if scan_btn
-                        .on_hover_text("Sends SDO requests (0x1000/0x1018) to discover silent nodes")
-                        .clicked()
-                    {
-                        self.start_active_scan();
-                    }
-                });
-            });
-
-            // Stop scan when expected time passed (best-effort).
-            if self.active_scan_running {
-                if let Some(end_at) = self.active_scan_expected_end_at {
-                    if Instant::now() >= end_at {
-                        self.active_scan_running = false;
-                        self.active_scan_started_at = None;
-                        self.active_scan_expected_end_at = None;
-                    }
-                }
-            }
-
-            egui::Grid::new("observed_nodes")
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.label("Node ID");
-                    ui.label("Frames");
-                    ui.label("Last seen");
-                    ui.label("Types");
-                    ui.label("State");
-                    ui.label("Profile");
-                    ui.label("Vendor");
-                    ui.label("Product");
-                    ui.end_row();
-
-                    let now = Instant::now();
-                    let mut any = false;
-                    for n in self.node_scan.values() {
-                        any = true;
-                        ui.monospace(format!("{}", n.node_id));
-                        ui.monospace(format!("{}", n.frames));
-                        let last_seen = n.last_seen.map(|t| now.duration_since(t).as_secs_f32());
-                        if let Some(s) = last_seen {
-                            ui.monospace(format!("{s:.1}s"));
-                        } else {
-                            ui.monospace("-");
-                        }
-                        ui.label(n.types_string());
-                        ui.label(
-                            n.heartbeat_state
-                                .map(|s| s.as_str().to_string())
-                                .unwrap_or_else(|| "-".to_string()),
-                        );
-                        ui.label(n.profile_string());
-                        ui.label(n.vendor_string());
-                        ui.monospace(n.product_string());
-                        ui.end_row();
-                    }
-
-                    if !any {
-                        ui.weak("No nodes observed yet");
-                        ui.end_row();
-                    }
-                });
-            
-            ui.separator();
-
             // Bus occupation details
             ui.label("🔋 Bus Occupation Details:");
             ui.separator();
@@ -466,51 +628,6 @@ impl Gui {
             ui.label(format!("• Peak: {:.1} msg/s", self.bus_stats.peak_msg_rate()));
             ui.label(format!("• Average: {:.2} msg/s", self.bus_stats.avg_msg_rate()));
             ui.label(format!("• Total: {}", self.bus_stats.total_messages()));
-        });
-    }
-
-    fn start_active_scan(&mut self) {
-        const THROTTLE_MS: u64 = 8;
-        const NODES: u64 = 127;
-        const REQS_PER_NODE: u64 = 5; // 0x1000:00 and 0x1018:01..04
-        let total_reqs = NODES * REQS_PER_NODE;
-        let estimated_ms = total_reqs * THROTTLE_MS + 500;
-
-        self.node_scan.clear();
-        self.active_scan_running = true;
-        let started_at = Instant::now();
-        self.active_scan_started_at = Some(started_at);
-        self.active_scan_expected_end_at = Some(started_at + Duration::from_millis(estimated_ms));
-
-        let sender = self.write_sender.clone();
-        tokio::spawn(async move {
-            for node_id in 1u8..=127u8 {
-                let cob_id = 0x600u32 + u32::from(node_id);
-                let requests: &[(u16, u8)] = &[
-                    (0x1000, 0x00),
-                    (0x1018, 0x01),
-                    (0x1018, 0x02),
-                    (0x1018, 0x03),
-                    (0x1018, 0x04),
-                ];
-
-                for (index, sub) in requests {
-                    let data = vec![
-                        0x40,
-                        (*index & 0x00FF) as u8,
-                        (*index >> 8) as u8,
-                        *sub,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ];
-                    let _ = sender
-                        .send(WriteCommand::SendRaw { cob_id, data })
-                        .await;
-                    tokio::time::sleep(Duration::from_millis(THROTTLE_MS)).await;
-                }
-            }
         });
     }
 
@@ -1476,6 +1593,8 @@ impl eframe::App for Gui {
             return;
         }
 
+        self.poll_multi_bitrate_scan();
+
         // Poll remote connection status (non-blocking)
         self.poll_remote_connection_status();
         
@@ -1556,13 +1675,34 @@ impl eframe::App for Gui {
         // Left side panel for message sender
         egui::SidePanel::left("message_sender_panel")
             .resizable(true)
-            .default_width(350.0)
-            .min_width(300.0)
+            .default_width(380.0)
+            .min_width(320.0)
             .show(ctx, |ui| {
+                self.node_config_panel.show_left_tabs(ui);
+                if self.node_config_panel.take_multi_bitrate_request() {
+                    self.begin_multi_bitrate_scan();
+                }
+                let local_can_scan = self.connection_mode == ConnectionMode::Local
+                    && self.is_interface_up;
                 ui.add_enabled_ui(connected, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        self.message_sender.ui(ui);
-                    });
+                    use crate::node_config_panel::LeftPanelTab;
+                    match self.node_config_panel.left_tab {
+                        LeftPanelTab::Messages => {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                self.message_sender.ui(ui);
+                            });
+                        }
+                        LeftPanelTab::NodesConfig => {
+                            let write_sender = self.write_sender.clone();
+                            self.node_config_panel.ui(
+                                ui,
+                                connected,
+                                &mut self.node_scan,
+                                &write_sender,
+                                local_can_scan,
+                            );
+                        }
+                    }
                 });
             });
         
@@ -1608,6 +1748,7 @@ impl eframe::App for Gui {
                     self.bus_stats.reset();
                     self.bus_load_history.clear();
                     self.node_scan.clear();
+                    self.node_config_panel.clear_on_buffer_clear();
                 }
 
                 ui.separator();
@@ -1625,4 +1766,12 @@ impl eframe::App for Gui {
             self.try_remote_disconnect();
         }
     }
+}
+
+fn format_bitrate_label(bps: u32) -> String {
+    CANOPEN_BITRATES
+        .iter()
+        .find(|(v, _)| *v == bps)
+        .map(|(_, l)| (*l).to_string())
+        .unwrap_or_else(|| format!("{bps} bit/s"))
 }
