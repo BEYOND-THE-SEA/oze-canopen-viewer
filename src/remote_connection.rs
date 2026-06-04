@@ -6,8 +6,10 @@
 //! - Create and manage local virtual CAN interfaces (vcan0)
 //! - Bridge remote CAN traffic to the local virtual interface
 
-use std::path::PathBuf;
 use std::env;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
 use tokio::process::Command;
@@ -76,6 +78,45 @@ impl CleanupInfo {
     }
 }
 
+#[cfg(cannelloni_embedded)]
+const EMBEDDED_CANNELLONI: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/cannelloni_embedded"));
+
+/// Extract cannelloni baked in at `cargo build` (requires `bin/cannelloni` present).
+#[cfg(cannelloni_embedded)]
+fn materialize_embedded_cannelloni() -> Option<PathBuf> {
+    let path = env::temp_dir().join(format!(
+        "oze-canopen-viewer-{}-cannelloni",
+        env!("CARGO_PKG_VERSION")
+    ));
+    if path.is_file() {
+        if fs::metadata(&path).ok().map(|m| m.len()) == Some(EMBEDDED_CANNELLONI.len() as u64) {
+            return Some(path);
+        }
+    }
+    fs::write(&path, EMBEDDED_CANNELLONI).ok()?;
+    set_executable(&path).ok()?;
+    Some(path)
+}
+
+#[cfg(not(cannelloni_embedded))]
+fn materialize_embedded_cannelloni() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms)
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 /// Default port for cannelloni TCP communication
 pub const DEFAULT_CANNELLONI_PORT: u16 = 29536;
 
@@ -125,18 +166,19 @@ impl RemoteConnection {
         }
     }
 
-    /// Get the path to the bundled cannelloni binary
+    /// Path to cannelloni for local client start and remote deploy (SCP).
     pub fn get_cannelloni_binary_path() -> PathBuf {
-        // 1. Check in bin/ relative to the executable
+        if let Some(path) = materialize_embedded_cannelloni() {
+            return path;
+        }
+
         if let Ok(exe_path) = env::current_exe() {
             if let Some(exe_dir) = exe_path.parent() {
-                // In bin/ next to the executable
                 let bin_path = exe_dir.join("bin").join("cannelloni");
                 if bin_path.exists() {
                     return bin_path;
                 }
 
-                // In the same directory as the executable
                 let same_dir = exe_dir.join("cannelloni");
                 if same_dir.exists() {
                     return same_dir;
@@ -144,13 +186,11 @@ impl RemoteConnection {
             }
         }
 
-        // 2. Check in the project directory (for development)
         let project_bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin").join("cannelloni");
         if project_bin.exists() {
             return project_bin;
         }
 
-        // 3. Fallback: check in system path
         PathBuf::from("/usr/local/bin/cannelloni")
     }
 

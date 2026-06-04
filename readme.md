@@ -28,19 +28,21 @@ If you are using Ubuntu 22.04 then you can download precompiled `.deb` file from
 
 Or build it yourself:
 
-1. Build the application:
+1. (Optional, for **remote** CAN) place a Linux `cannelloni` binary at `bin/cannelloni`. It is embedded into the release executable at build time, so you can share a single `oze-canopen-viewer` binary without a sidecar file.
+
+2. Build the application:
 ```sh
 cargo build --release
 ```
-2. Add access to manage the interface:
+3. Add access to manage the interface:
 ```sh
 sudo setcap cap_NET_ADMIN=ep ./target/release/oze-canopen-viewer
 ```
-3. Launch:
+4. Launch:
 ```sh
 ./target/release/oze-canopen-viewer
 ```
-4. Enter the `can name` and `bitrate` if needed, then click `Connect`.
+5. Enter the `can name` and `bitrate` if needed, then click `Connect`.
 
 You can also run it without setcap. To do this, start the program, enter the interface name, click `Connect`, and then execute:
 ```sh

@@ -2,6 +2,7 @@
 name = "oze-canopen-viewer"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 description = "OZON CanOpenViewer"
 rust-version = "1.75"
 authors = ["OZON TECH", "Aleksandr Lutsai <s.lyra@ya.ru>"]
