@@ -145,6 +145,31 @@ impl ObservedNode {
     }
 }
 
+/// Bitrate to use for SDO/config when host rate does not match detection.
+///
+/// Returns `None` if host can stay as-is (no detection data, or host already in list).
+pub fn preferred_operation_bitrate(node: &ObservedNode, host_bps: Option<u32>) -> Option<u32> {
+    if node.detected_bitrates.is_empty() {
+        return None;
+    }
+    if let Some(host) = host_bps {
+        if node.detected_bitrates.contains(&host) {
+            return None;
+        }
+    }
+    Some(pick_detected_bitrate(&node.detected_bitrates))
+}
+
+fn pick_detected_bitrate(detected: &[u32]) -> u32 {
+    if detected.len() == 1 {
+        return detected[0];
+    }
+    if detected.contains(&250_000) {
+        return 250_000;
+    }
+    *detected.iter().min().unwrap_or(&250_000)
+}
+
 fn format_bitrate_short(bps: u32) -> String {
     if bps >= 1_000_000 {
         format!("{}M", bps / 1_000_000)
@@ -169,11 +194,14 @@ pub fn node_id_from_heartbeat_cob(cob_id: u16) -> Option<u8> {
 #[derive(Debug, Default)]
 pub struct NodeScan {
     nodes: BTreeMap<u8, ObservedNode>,
+    /// While set (e.g. active SDO bus scan), tag every seen node with this host CAN bitrate.
+    pub assumed_bitrate: Option<u32>,
 }
 
 impl NodeScan {
     pub fn clear(&mut self) {
         self.nodes.clear();
+        self.assumed_bitrate = None;
     }
 
     pub fn node_ids_sorted(&self) -> Vec<u8> {
@@ -223,6 +251,10 @@ impl NodeScan {
             return;
         };
 
+        if let Some(bps) = self.assumed_bitrate {
+            self.mark_detected_at_bitrate(node_id, bps);
+        }
+
         let entry = self.nodes.entry(node_id).or_insert_with(|| ObservedNode {
             node_id,
             ..ObservedNode::default()
@@ -266,6 +298,38 @@ fn is_node_emitted_message(t: RxMessageType) -> bool {
         t,
         RxMessageType::Pdo | RxMessageType::SdoTx | RxMessageType::Emcy | RxMessageType::Guarding
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preferred_bitrate_empty_detection() {
+        let node = ObservedNode::default();
+        assert_eq!(preferred_operation_bitrate(&node, Some(250_000)), None);
+    }
+
+    #[test]
+    fn preferred_bitrate_host_matches() {
+        let mut node = ObservedNode::default();
+        node.detected_bitrates = vec![125_000, 250_000];
+        assert_eq!(preferred_operation_bitrate(&node, Some(250_000)), None);
+    }
+
+    #[test]
+    fn preferred_bitrate_picks_when_mismatch() {
+        let mut node = ObservedNode::default();
+        node.detected_bitrates = vec![125_000];
+        assert_eq!(preferred_operation_bitrate(&node, Some(250_000)), Some(125_000));
+    }
+
+    #[test]
+    fn preferred_bitrate_prefers_250k_among_many() {
+        let mut node = ObservedNode::default();
+        node.detected_bitrates = vec![500_000, 125_000, 250_000];
+        assert_eq!(preferred_operation_bitrate(&node, Some(50_000)), Some(250_000));
+    }
 }
 
 fn le_bytes_to_u32(bytes: &[u8]) -> Option<u32> {

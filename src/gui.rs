@@ -11,7 +11,7 @@ use crate::{
     node_config_panel::NodeConfigPanel,
     node_scan::{node_id_from_heartbeat_cob, NodeScan},
     remote_connection::{CleanupInfo, LocalCannelloniClient, RemoteConnection, RemoteSetupStatus, DEFAULT_CANNELLONI_PORT},
-    theme::{theme, OZON_GRAY, OZON_PINK},
+    theme::theme,
     viewer::Viewer,
 };
 use egui::{emath::Numeric, Button, Layout, TextEdit, Ui};
@@ -288,13 +288,8 @@ impl Gui {
                     scan.index + 1,
                     scan.bitrates.len()
                 ));
-                let can_name = self.can_name_raw.clone();
-                let password = self.local_sudo_password.clone();
-                match Self::configure_can_interface(&can_name, Some(bps), &password) {
+                match self.set_host_bitrate(bps) {
                     Ok(()) => {
-                        self.selected_bitrate = Some(bps);
-                        self.connection.bitrate = Some(bps);
-                        self.send_driver_control();
                         scan.phase = MultiBitratePhase::WaitLink;
                         scan.deadline = now + std::time::Duration::from_millis(400);
                         self.node_config_panel
@@ -388,15 +383,10 @@ impl Gui {
             }
             MultiBitratePhase::RestoreHostBitrate => {
                 let restore = scan.restore_bitrate;
-                let can_name = self.can_name_raw.clone();
-                let password = self.local_sudo_password.clone();
-                match Self::configure_can_interface(&can_name, Some(restore), &password) {
+                match self.set_host_bitrate(restore) {
                     Ok(()) => {
-                        self.selected_bitrate = Some(restore);
-                        self.connection.bitrate = Some(restore);
-                        self.send_driver_control();
                         self.node_config_panel.push_log(format!(
-                            "Host CAN restored to {} bit/s",
+                            "Host CAN restored to {}",
                             format_bitrate_label(restore)
                         ));
                     }
@@ -762,14 +752,16 @@ impl Gui {
             .map(|raw| Self::parse_interface_details("Remote", &self.remote_can_interface, &raw));
     }
 
-    fn show_interface_details(ui: &mut Ui, details: &InterfaceDetails) {
+    fn show_interface_details(ui: &mut Ui, details: &InterfaceDetails, operational_bps: Option<u32>) {
         ui.horizontal_wrapped(|ui| {
             ui.strong(format!("{} {}:", details.scope, details.name));
             ui.monospace(format!(
                 "{} | type {}",
                 details.state, details.interface_type
             ));
-            if let Some(bitrate) = &details.bitrate {
+            if let Some(bps) = operational_bps {
+                ui.monospace(format!("bitrate {}", format_bitrate_label(bps)));
+            } else if let Some(bitrate) = &details.bitrate {
                 ui.monospace(format!("bitrate {}", bitrate));
             }
             for extra in &details.extras {
@@ -791,11 +783,21 @@ impl Gui {
         ui.separator();
 
         if let Some(details) = &self.local_interface_details {
-            Self::show_interface_details(ui, details);
+            let op = match self.connection_mode {
+                ConnectionMode::Local if self.is_interface_up => self.selected_bitrate,
+                ConnectionMode::Remote if self.is_remote_connected => self.selected_bitrate,
+                _ => None,
+            };
+            Self::show_interface_details(ui, details, op);
         }
 
         if let Some(details) = &self.remote_interface_details {
-            Self::show_interface_details(ui, details);
+            let op = if self.is_remote_connected {
+                self.selected_bitrate
+            } else {
+                None
+            };
+            Self::show_interface_details(ui, details, op);
         }
 
         if show_remote_status {
@@ -868,7 +870,129 @@ impl Gui {
         Ok(())
     }
 
-    /// Configure the CAN interface using ip link commands with password
+    fn sync_bitrate_ui_state(&mut self) {
+        match self.connection_mode {
+            ConnectionMode::Local if self.is_interface_up => {
+                let can_name = self.can_name_raw.clone();
+                self.refresh_local_interface_details(&can_name);
+            }
+            ConnectionMode::Remote if self.is_remote_connected => {
+                self.refresh_local_interface_details("vcan0");
+                self.refresh_remote_interface_details();
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply a new host/viewer bitrate (combo, node config align, multi-bitrate scan, …).
+    fn set_host_bitrate(&mut self, bps: u32) -> Result<(), String> {
+        if self.connection_mode != ConnectionMode::Local || !self.is_interface_up {
+            return Err("Local CAN connection required to change bitrate".to_string());
+        }
+        if self.local_sudo_password.is_empty() {
+            return Err("Sudo password required (connect locally once)".to_string());
+        }
+        Self::configure_can_interface(
+            &self.can_name_raw,
+            Some(bps),
+            &self.local_sudo_password,
+        )?;
+        self.selected_bitrate = Some(bps);
+        self.connection.bitrate = Some(bps);
+        self.send_driver_control();
+        self.sync_bitrate_ui_state();
+        Ok(())
+    }
+
+    fn set_remote_operational_bitrate(&mut self, bps: u32) -> Result<(), String> {
+        if !self.is_remote_connected {
+            return Err("Remote connection required to change bitrate".to_string());
+        }
+        let remote = RemoteConnection::new(
+            self.remote_ssh_host.clone(),
+            self.remote_ssh_user.clone(),
+            self.remote_ssh_password.clone(),
+            self.remote_can_interface.clone(),
+            Some(bps),
+            DEFAULT_CANNELLONI_PORT,
+        );
+        tokio::runtime::Handle::current()
+            .block_on(remote.setup_can_interface())
+            .map_err(|e| format!("Remote bitrate change failed: {e}"))?;
+        self.selected_bitrate = Some(bps);
+        self.connection.bitrate = Some(bps);
+        self.send_driver_control();
+        self.sync_bitrate_ui_state();
+        Ok(())
+    }
+
+    /// Bitrate combo / programmatic change while connected or before connect.
+    fn try_set_operational_bitrate(&mut self, bps: u32) -> Result<(), String> {
+        if self.selected_bitrate == Some(bps) {
+            return Ok(());
+        }
+        match self.connection_mode {
+            ConnectionMode::Local => {
+                if self.is_interface_up {
+                    self.set_host_bitrate(bps)
+                } else {
+                    self.selected_bitrate = Some(bps);
+                    Ok(())
+                }
+            }
+            ConnectionMode::Remote => {
+                if self.is_remote_connected {
+                    self.set_remote_operational_bitrate(bps)
+                } else {
+                    self.selected_bitrate = Some(bps);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn on_bitrate_combo_changed(&mut self, bps: u32) {
+        match self.try_set_operational_bitrate(bps) {
+            Ok(()) => {}
+            Err(e) => {
+                log::error!("Bitrate change failed: {e}");
+                self.node_config_panel
+                    .push_log(format!("Bitrate change failed: {e}"));
+            }
+        }
+    }
+
+    fn process_node_config_actions(&mut self) {
+        use crate::node_config_panel::NodeConfigAction;
+
+        let actions = self.node_config_panel.take_pending_actions();
+        let write_sender = self.write_sender.clone();
+        for action in actions {
+            match action {
+                NodeConfigAction::SetHostBitrate {
+                    bps,
+                    node_id,
+                    detected_summary,
+                } => match self.set_host_bitrate(bps) {
+                    Ok(()) => {
+                        self.node_config_panel.push_log(format!(
+                            "Host CAN aligned to {} for node {node_id} (detected: {detected_summary})",
+                            format_bitrate_label(bps)
+                        ));
+                    }
+                    Err(e) => {
+                        self.node_config_panel.push_log(format!("Error: {e}"));
+                        return;
+                    }
+                },
+                other => {
+                    self.node_config_panel
+                        .execute_action(other, &write_sender);
+                }
+            }
+        }
+    }
+
     fn configure_can_interface(can_name: &str, bitrate: Option<u32>, password: &str) -> Result<(), String> {
         // First, bring the interface down (ignore errors if already down)
         let _ = Self::run_sudo_command(password, &["ip", "link", "set", "down", can_name]);
@@ -929,25 +1053,22 @@ impl Gui {
                 .desired_width(80.0),
         );
 
-        // Bitrate dropdown (disabled when connected)
-        let current_label = self.selected_bitrate
-            .and_then(|br| CANOPEN_BITRATES.iter().find(|(val, _)| *val == br))
-            .map(|(_, label)| *label)
-            .unwrap_or("Select bitrate");
-        
-        ui.add_enabled_ui(!self.is_interface_up, |ui| {
-            egui::ComboBox::from_id_salt("bitrate_selector")
-                .selected_text(current_label)
-                .width(100.0)
-                .show_ui(ui, |ui| {
-                    for (value, label) in CANOPEN_BITRATES {
-                        let is_selected = self.selected_bitrate == Some(*value);
-                        if ui.selectable_label(is_selected, *label).clicked() {
-                            self.selected_bitrate = Some(*value);
-                        }
+        let current_label = self
+            .selected_bitrate
+            .map(format_bitrate_label)
+            .unwrap_or_else(|| "Select bitrate".to_string());
+
+        egui::ComboBox::from_id_salt("bitrate_selector")
+            .selected_text(&current_label)
+            .width(100.0)
+            .show_ui(ui, |ui| {
+                for (value, label) in CANOPEN_BITRATES {
+                    let is_selected = self.selected_bitrate == Some(*value);
+                    if ui.selectable_label(is_selected, *label).clicked() {
+                        self.on_bitrate_combo_changed(*value);
                     }
-                });
-        });
+                }
+            });
 
         if self.is_interface_up {
             // Disconnect button
@@ -1032,21 +1153,20 @@ impl Gui {
                 .desired_width(60.0),
         ).on_hover_text("CAN interface on the remote machine (e.g., can0)");
 
-        // Bitrate dropdown
-        let current_label = self.selected_bitrate
-            .and_then(|br| CANOPEN_BITRATES.iter().find(|(val, _)| *val == br))
-            .map(|(_, label)| *label)
-            .unwrap_or("Bitrate");
-        
-        ui.add_enabled_ui(!self.is_remote_connected && !is_connecting, |ui| {
+        let current_label = self
+            .selected_bitrate
+            .map(format_bitrate_label)
+            .unwrap_or_else(|| "Bitrate".to_string());
+
+        ui.add_enabled_ui(!is_connecting, |ui| {
             egui::ComboBox::from_id_salt("remote_bitrate_selector")
-                .selected_text(current_label)
+                .selected_text(&current_label)
                 .width(100.0)
                 .show_ui(ui, |ui| {
                     for (value, label) in CANOPEN_BITRATES {
                         let is_selected = self.selected_bitrate == Some(*value);
                         if ui.selectable_label(is_selected, *label).clicked() {
-                            self.selected_bitrate = Some(*value);
+                            self.on_bitrate_combo_changed(*value);
                         }
                     }
                 });
@@ -1276,8 +1396,7 @@ impl Gui {
                 self.password_input.clear();
                 self.config_status = None;
                 self.pending_action = None;
-                let can_name = self.can_name_raw.clone();
-                self.refresh_local_interface_details(&can_name);
+                self.sync_bitrate_ui_state();
             }
             Err(e) => {
                 log::error!("Failed to configure CAN interface: {}", e);
@@ -1569,16 +1688,6 @@ impl Gui {
         }
     }
 
-    fn show_connection_help(ui: &mut Ui) {
-        ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(OZON_PINK, "↑ You need to enter can name, i.e.");
-                    ui.colored_label(OZON_GRAY, "can0");
-                    ui.colored_label(OZON_PINK, "and optionally bitrate. If bitrate is set then link will go down, bitrate will be changed and then link will be set up.");
-                });
-        ui.colored_label(OZON_PINK, "Or your CAN interface is not connected properly");
-        ui.label("Or you can execute program with arguments default values, for help execute:");
-        ui.colored_label(OZON_GRAY, "oze-canopen-viewer --help");
-    }
 }
 
 impl eframe::App for Gui {
@@ -1665,19 +1774,20 @@ impl eframe::App for Gui {
                 self.show_connection_feedback(ui);
             });
 
-            if !connected {
-                Self::show_connection_help(ui);
-            }
         });
 
         self.viewer.message_row.format = self.format;
 
-        // Left side panel for message sender
-        egui::SidePanel::left("message_sender_panel")
+        // Left side panel: default + min only (no max). Content must fill panel width so
+        // egui stores the correct size and the resize handle works (see egui SidePanel docs).
+        use crate::node_config_panel::{LEFT_PANEL_DEFAULT_WIDTH, LEFT_PANEL_MIN_WIDTH};
+
+        egui::SidePanel::left("left_panel_v4")
             .resizable(true)
-            .default_width(380.0)
-            .min_width(320.0)
+            .default_width(LEFT_PANEL_DEFAULT_WIDTH)
+            .min_width(LEFT_PANEL_MIN_WIDTH)
             .show(ctx, |ui| {
+                ui.set_min_width(ui.available_width());
                 self.node_config_panel.show_left_tabs(ui);
                 if self.node_config_panel.take_multi_bitrate_request() {
                     self.begin_multi_bitrate_scan();
@@ -1693,25 +1803,37 @@ impl eframe::App for Gui {
                             });
                         }
                         LeftPanelTab::NodesConfig => {
+                            use crate::node_config_panel::NodeConfigHostCtx;
                             let write_sender = self.write_sender.clone();
+                            let host = NodeConfigHostCtx {
+                                host_bitrate: self.selected_bitrate,
+                                can_align_host_bitrate: self.connection_mode
+                                    == ConnectionMode::Local
+                                    && self.is_interface_up
+                                    && !self.local_sudo_password.is_empty(),
+                            };
+                            // Scrolling is handled inside the panel (top + fixed log).
                             self.node_config_panel.ui(
                                 ui,
                                 connected,
                                 &mut self.node_scan,
                                 &write_sender,
                                 local_can_scan,
+                                &host,
                             );
                         }
                     }
                 });
             });
+
+        self.process_node_config_actions();
         
         // Right side panel for detailed stats (toggleable)
         if self.show_stats_panel {
             egui::SidePanel::right("stats_panel")
                 .resizable(true)
                 .default_width(250.0)
-                .min_width(200.0)
+                .min_width(100.0)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.heading("📈 Stats");

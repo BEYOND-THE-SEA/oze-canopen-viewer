@@ -6,7 +6,7 @@ use crate::{
         resolve_profile, spawn_config_script, write_command_raw, ConfigStep, DeviceProfile,
         CLI_BITRATES,
     },
-    node_scan::{NodeScan, ObservedNode},
+    node_scan::{preferred_operation_bitrate, NodeScan, ObservedNode},
 };
 use egui::{Button, ComboBox, Layout, ScrollArea, TextEdit, Ui};
 use oze_canopen::proto::sdo::ResponseData;
@@ -17,7 +17,21 @@ const LOG_MAX: usize = 80;
 const OP_TIMEOUT_SECS: f32 = 2.0;
 const ACTIVE_SCAN_THROTTLE_MS: u64 = 8;
 /// Fixed height for the operation log strip at the bottom of the panel.
-const OPERATION_LOG_HEIGHT: f32 = 88.0;
+const OPERATION_LOG_HEIGHT: f32 = 300.0;
+
+/// Left side panel width (must match [`gui`](crate::gui) `SidePanel` settings).
+pub const LEFT_PANEL_DEFAULT_WIDTH: f32 = 300.0;
+pub const LEFT_PANEL_MIN_WIDTH: f32 = 100.0;
+/// Soft cap for inner layout (combos/tables); SidePanel itself has no max_width.
+pub const LEFT_PANEL_LAYOUT_MAX_WIDTH: f32 = 480.0;
+
+/// Closed node combo width — fixed so content never pulls the panel to full window width.
+const NODE_COMBO_WIDTH: f32 = 100.0;
+const NODE_COMBO_MIN_WIDTH: f32 = 52.0;
+const NODE_NAV_BUTTONS_WIDTH: f32 = 44.0;
+
+/// Observed-node table column widths as fractions of table width (ID, Vendor, Profile, Bitrates).
+const NODE_TABLE_COL_FRACS: [f32; 4] = [0.10, 0.44, 0.24, 0.22];
 
 #[derive(Debug, Clone)]
 struct PendingOp {
@@ -34,13 +48,47 @@ pub enum LeftPanelTab {
     NodesConfig,
 }
 
+/// Host CAN context for node operations (bitrate alignment).
+pub struct NodeConfigHostCtx {
+    pub host_bitrate: Option<u32>,
+    /// Local CAN up and sudo password available — required to change host bitrate.
+    pub can_align_host_bitrate: bool,
+}
+
+/// Actions queued during UI; drained by [`Gui`](crate::gui::Gui) after the panel is drawn.
+#[derive(Debug, Clone)]
+pub enum NodeConfigAction {
+    SetHostBitrate {
+        bps: u32,
+        node_id: u8,
+        detected_summary: String,
+    },
+    RunConfigScript {
+        steps: Vec<ConfigStep>,
+        node_id: u8,
+    },
+    SendGenericSdoDownload {
+        node_id: u8,
+        index: u16,
+        subindex: u8,
+        data: Vec<u8>,
+    },
+}
+
 pub struct NodeConfigPanel {
     pub left_tab: LeftPanelTab,
     pub selected_node_id: Option<u8>,
     profile: DeviceProfile,
     new_node_id: String,
     new_bitrate: u32,
-    confirm_writes: bool,
+    /// Last node ID value for which Apply was enabled or applied (debounce baseline).
+    node_id_apply_baseline: String,
+    bitrate_apply_baseline: u32,
+    node_id_apply_after: Option<Instant>,
+    bitrate_apply_after: Option<Instant>,
+    /// Value last seen when the node-ID debounce timer was started (re-arm on edit).
+    node_id_apply_armed_for: Option<String>,
+    bitrate_apply_armed_for: Option<u32>,
     generic_index: String,
     generic_subindex: String,
     generic_data: String,
@@ -55,6 +103,7 @@ pub struct NodeConfigPanel {
     pub multi_bitrate_status: Option<String>,
     /// When true, any scan is in progress (active SDO or multi-bitrate).
     pub any_scan_running: bool,
+    pending_actions: Vec<NodeConfigAction>,
 }
 
 impl Default for NodeConfigPanel {
@@ -65,7 +114,12 @@ impl Default for NodeConfigPanel {
             profile: DeviceProfile::Auto,
             new_node_id: String::from("2"),
             new_bitrate: 250_000,
-            confirm_writes: false,
+            node_id_apply_baseline: String::from("2"),
+            bitrate_apply_baseline: 250_000,
+            node_id_apply_after: None,
+            bitrate_apply_after: None,
+            node_id_apply_armed_for: None,
+            bitrate_apply_armed_for: None,
             generic_index: String::from("2000"),
             generic_subindex: String::from("00"),
             generic_data: String::from("02"),
@@ -77,6 +131,7 @@ impl Default for NodeConfigPanel {
             request_multi_bitrate_scan: false,
             multi_bitrate_status: None,
             any_scan_running: false,
+            pending_actions: Vec::new(),
         }
     }
 }
@@ -94,6 +149,10 @@ impl NodeConfigPanel {
         ui.separator();
     }
 
+    pub fn take_pending_actions(&mut self) -> Vec<NodeConfigAction> {
+        std::mem::take(&mut self.pending_actions)
+    }
+
     pub fn ui(
         &mut self,
         ui: &mut Ui,
@@ -101,28 +160,30 @@ impl NodeConfigPanel {
         node_scan: &mut NodeScan,
         write_sender: &mpsc::Sender<WriteCommand>,
         local_can_scan_enabled: bool,
+        host: &NodeConfigHostCtx,
     ) {
-        self.poll_active_scan();
+        self.poll_active_scan(node_scan);
         self.any_scan_running =
             self.active_scan_running || self.multi_bitrate_status.is_some();
 
-        let total_h = ui.available_height().max(200.0);
-        let top_max = (total_h - OPERATION_LOG_HEIGHT - 28.0).max(120.0);
+        let panel_w = ui.available_width().min(LEFT_PANEL_LAYOUT_MAX_WIDTH);
 
         ui.vertical(|ui| {
-            ui.set_min_height(total_h);
-            ui.set_max_height(total_h);
+            let top_max = (ui.available_height() - OPERATION_LOG_HEIGHT - 12.0).max(80.0);
 
             ScrollArea::vertical()
                 .id_salt("nodes_config_top")
+                .auto_shrink([false, false])
                 .max_height(top_max)
                 .show(ui, |ui| {
                     self.draw_top_section(
                         ui,
+                        panel_w,
                         connected,
                         node_scan,
                         write_sender,
                         local_can_scan_enabled,
+                        host,
                     );
                 });
 
@@ -133,10 +194,12 @@ impl NodeConfigPanel {
     fn draw_top_section(
         &mut self,
         ui: &mut Ui,
+        panel_w: f32,
         connected: bool,
         node_scan: &mut NodeScan,
         write_sender: &mpsc::Sender<WriteCommand>,
         local_can_scan_enabled: bool,
+        host: &NodeConfigHostCtx,
     ) {
         ui.heading("Nodes & Config");
         ui.separator();
@@ -150,11 +213,7 @@ impl NodeConfigPanel {
                 ""
             };
             if !status.is_empty() {
-                ui.add(
-                    egui::Label::new(egui::RichText::new(status).weak().size(11.0))
-                        .wrap()
-                        .truncate(),
-                );
+                ui.label(egui::RichText::new(status).weak().size(11.0));
             }
         }
 
@@ -179,12 +238,12 @@ impl NodeConfigPanel {
                     .on_hover_text("SDO read 0x1000 / 0x1018 for nodes 1–127 (non-destructive)")
                     .clicked()
                 {
-                    self.start_active_scan(write_sender.clone(), node_scan);
+                    self.start_active_scan(write_sender.clone(), node_scan, host.host_bitrate);
                 }
             });
         });
 
-        self.draw_node_selector(ui, node_scan);
+        self.draw_node_selector(ui, panel_w, node_scan);
 
         ui.separator();
 
@@ -201,23 +260,47 @@ impl NodeConfigPanel {
         );
 
         if let Some(n) = node_scan.get(node_id) {
-            self.show_node_details(ui, n);
+            self.show_node_extra_details(ui, n, host.host_bitrate);
         }
 
         ui.separator();
-        ui.label("Device profile:");
-        ComboBox::from_id_salt("device_profile_combo")
-            .selected_text(self.profile.label())
-            .show_ui(ui, |ui| {
-                for p in DeviceProfile::ALL {
-                    ui.selectable_value(&mut self.profile, p, p.label());
-                }
-            });
+        ui.horizontal(|ui| {
+            ui.label("Device profile:");
+            ComboBox::from_id_salt("device_profile_combo")
+                .selected_text(self.profile.label())
+                .width(160.0)
+                .show_ui(ui, |ui| {
+                    for p in DeviceProfile::ALL {
+                        ui.selectable_value(&mut self.profile, p, p.label());
+                    }
+                });
+        });
         ui.weak(format!("Resolved for actions: {}", resolved.label()));
         if resolved.is_dangerous() {
-            ui.colored_label(
-                egui::Color32::YELLOW,
-                "Warning: LSS global affects all LSS-capable nodes on the bus.",
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "Warning: LSS global affects all LSS-capable nodes on the bus.",
+                    )
+                    .color(egui::Color32::YELLOW),
+                )
+                .wrap(),
+            );
+        }
+
+        if ui
+            .add_enabled(connected, Button::new("Read device config (SDO)"))
+            .on_hover_text(
+                "Non-destructive SDO read of node ID / bitrate (profile-specific OD). Does not change the profile selector.",
+            )
+            .clicked()
+        {
+            let steps = build_read_config_steps(resolved, node_id);
+            self.queue_with_bitrate_align(
+                node_scan,
+                node_id,
+                host,
+                NodeConfigAction::RunConfigScript { steps, node_id },
             );
         }
 
@@ -233,25 +316,35 @@ impl NodeConfigPanel {
                     .desired_width(48.0)
                     .hint_text("1-127"),
             );
+            let now = Instant::now();
+            self.update_apply_debounce(now);
+            let node_id_apply = connected
+                && self.node_id_apply_ready(now)
+                && matches!(&node_id_steps, Ok(s) if !s.is_empty());
             if ui
-                .add_enabled(connected && self.confirm_writes, Button::new("Apply"))
-                .on_hover_text("Requires confirmation checkbox")
+                .add_enabled(node_id_apply, Button::new("Apply"))
+                .on_hover_text("Enabled 1 s after you change the node ID")
                 .clicked()
             {
                 if let Ok(steps) = node_id_steps.clone() {
-                    self.run_steps(write_sender, steps, node_id);
+                    self.queue_with_bitrate_align(node_scan, node_id, host, NodeConfigAction::RunConfigScript {
+                        steps,
+                        node_id,
+                    });
+                    self.commit_node_id_apply_baseline();
                 } else if let Err(e) = &node_id_steps {
                     self.push_log(format!("Error: {e}"));
                 }
             }
         });
-        let node_preview_summary = match &node_id_steps {
-            Ok(_) => format!("node {node_id} → {}", self.new_node_id.trim()),
-            Err(e) => format!("invalid: {e}"),
-        };
+        let node_preview_summary = format!("node {node_id} → {}", self.new_node_id.trim());
         show_steps_collapsing(ui, "preview_node_id", &node_preview_summary, node_id_steps);
 
-        let bitrate_steps = build_change_bitrate_steps(resolved, node_id, self.new_bitrate);
+        let current_bitrate = node_scan
+            .get(node_id)
+            .and_then(|n| inferred_device_bitrate(n, host.host_bitrate));
+        let bitrate_steps =
+            build_change_bitrate_steps(resolved, node_id, self.new_bitrate, current_bitrate);
 
         ui.horizontal(|ui| {
             ui.label("Change device bitrate to:");
@@ -266,37 +359,34 @@ impl NodeConfigPanel {
                     ui.selectable_value(&mut self.new_bitrate, 1_000_000, "1 Mbit/s");
                     ui.selectable_value(&mut self.new_bitrate, 20_000, "20 kbit/s");
                 });
+            let now = Instant::now();
+            self.update_apply_debounce(now);
+            let bitrate_apply = connected
+                && self.bitrate_apply_ready(now)
+                && matches!(&bitrate_steps, Ok(s) if !s.is_empty());
             if ui
-                .add_enabled(connected && self.confirm_writes, Button::new("Apply"))
-                .on_hover_text("Requires confirmation checkbox")
+                .add_enabled(bitrate_apply, Button::new("Apply"))
+                .on_hover_text("Enabled 1 s after you change the bitrate")
                 .clicked()
             {
                 match bitrate_steps.clone() {
-                    Ok(steps) => self.run_steps(write_sender, steps, node_id),
+                    Ok(steps) => {
+                        self.queue_with_bitrate_align(
+                            node_scan,
+                            node_id,
+                            host,
+                            NodeConfigAction::RunConfigScript { steps, node_id },
+                        );
+                        self.commit_bitrate_apply_baseline();
+                    }
                     Err(e) => self.push_log(format!("Error: {e}")),
                 }
             }
         });
         ui.weak("After bitrate change, set the PC CAN interface to the same rate.");
 
-        let bitrate_preview_summary = match &bitrate_steps {
-            Ok(_) => format_bitrate_option(self.new_bitrate),
-            Err(e) => format!("invalid: {e}"),
-        };
+        let bitrate_preview_summary = format_bitrate_option(self.new_bitrate);
         show_steps_collapsing(ui, "preview_bitrate", &bitrate_preview_summary, bitrate_steps);
-
-        ui.checkbox(
-            &mut self.confirm_writes,
-            "I confirm persistent device writes",
-        );
-
-        if ui
-            .add_enabled(connected, Button::new("Read device config (SDO)"))
-            .clicked()
-        {
-            let steps = build_read_config_steps(resolved, node_id);
-            self.run_steps(write_sender, steps, node_id);
-        }
 
         ui.separator();
         ui.collapsing("Expert: generic SDO download", |ui| {
@@ -308,10 +398,10 @@ impl NodeConfigPanel {
             });
             ui.horizontal(|ui| {
                 ui.label("Data hex:");
-                ui.add(TextEdit::singleline(&mut self.generic_data).desired_width(160.0));
+                ui.add(TextEdit::singleline(&mut self.generic_data).desired_width(90.0));
             });
             if ui
-                .add_enabled(connected && self.confirm_writes, Button::new("Send SDO download"))
+                .add_enabled(connected, Button::new("Send SDO download"))
                 .clicked()
             {
                 if let (Ok(index), Ok(sub), Ok(data)) = (
@@ -320,16 +410,17 @@ impl NodeConfigPanel {
                     parse_hex(&self.generic_data),
                 ) {
                     if data.len() <= 4 {
-                        let _ = write_sender.try_send(WriteCommand::SendSdoDownload {
+                        self.queue_with_bitrate_align(
+                            node_scan,
                             node_id,
-                            index,
-                            subindex: sub,
-                            data,
-                        });
-                        self.track_op(node_id, index, sub, "Generic SDO download");
-                        self.push_log(format!(
-                            "Sent SDO download 0x{index:04X}:{sub:02X} to node {node_id}"
-                        ));
+                            host,
+                            NodeConfigAction::SendGenericSdoDownload {
+                                node_id,
+                                index,
+                                subindex: sub,
+                                data,
+                            },
+                        );
                     } else {
                         self.push_log("Error: max 4 bytes for expedited download".to_string());
                     }
@@ -344,23 +435,28 @@ impl NodeConfigPanel {
         }
     }
 
-    fn draw_node_selector(&mut self, ui: &mut Ui, node_scan: &NodeScan) {
+    fn draw_node_selector(&mut self, ui: &mut Ui, panel_w: f32, node_scan: &NodeScan) {
         let ids = node_scan.node_ids_sorted();
 
         if ids.len() == 1 && self.selected_node_id != Some(ids[0]) {
             self.select_node(ids[0]);
         }
 
-        ui.label("Observed node:");
         ui.horizontal(|ui| {
+            ui.label("Observed node:");
             let selected_label = self
                 .selected_node_id
-                .and_then(|id| node_scan.get(id).map(ObservedNode::selection_label))
+                .map(|id| format!("Node {id}"))
                 .unwrap_or_else(|| "— select —".to_string());
+
+            let spacing = ui.spacing().item_spacing.x;
+            let reserved = NODE_NAV_BUTTONS_WIDTH + spacing + 4.0;
+            let combo_width = (panel_w - reserved - 90.0)
+                .clamp(NODE_COMBO_MIN_WIDTH, NODE_COMBO_WIDTH);
 
             ComboBox::from_id_salt("observed_node_combo")
                 .selected_text(selected_label)
-                .width(ui.available_width().min(320.0))
+                .width(combo_width)
                 .show_ui(ui, |ui| {
                     for id in &ids {
                         if let Some(n) = node_scan.get(*id) {
@@ -387,42 +483,125 @@ impl NodeConfigPanel {
             .id_salt("nodes_config_table")
             .max_height(100.0)
             .show(ui, |ui| {
-                egui::Grid::new("nodes_config_observed")
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.label("ID");
-                        ui.label("Vendor");
-                        ui.label("Profile");
-                        ui.label("Bitrates");
-                        ui.end_row();
+                let table_w = panel_w.max(1.0);
+                let col_w = node_table_column_widths(table_w);
+                let row_h = ui.spacing().interact_size.y;
 
-                        if ids.is_empty() {
-                            ui.weak("No nodes yet — wait for traffic or run a scan");
-                            ui.end_row();
-                            return;
-                        }
+                if ids.is_empty() {
+                    grid_empty_row(ui, table_w);
+                    return;
+                }
 
-                        for id in ids {
-                            let Some(n) = node_scan.get(id) else {
-                                continue;
-                            };
-                            let selected = self.selected_node_id == Some(id);
-                            let row = ui.selectable_label(selected, format!("{id}"));
-                            if row.clicked() {
-                                self.select_node(id);
-                            }
-                            ui.add(egui::Label::new(n.vendor_string()).truncate());
-                            ui.add(egui::Label::new(n.profile_string()).truncate());
-                            ui.add(egui::Label::new(n.detected_bitrates_string()).truncate());
-                            ui.end_row();
+                ui.horizontal(|ui| {
+                    for (header, w) in ["ID", "Vendor", "Profile", "Bitrates"]
+                        .into_iter()
+                        .zip(col_w)
+                    {
+                        table_cell(ui, w, row_h, |ui| ui.strong(header));
+                    }
+                });
+                ui.separator();
+
+                for id in ids {
+                    let Some(n) = node_scan.get(id) else {
+                        continue;
+                    };
+                    let selected = self.selected_node_id == Some(id);
+                    let frame = if selected {
+                        egui::Frame::none()
+                            .fill(ui.visuals().selection.bg_fill)
+                            .inner_margin(egui::Margin::symmetric(2.0, 1.0))
+                    } else {
+                        egui::Frame::none()
+                    };
+
+                    let row = frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            table_cell(ui, col_w[0], row_h, |ui| {
+                                ui.label(format!("{id}"));
+                            });
+                            table_cell(ui, col_w[1], row_h, |ui| {
+                                ui.add(egui::Label::new(n.vendor_string()).truncate());
+                            });
+                            table_cell(ui, col_w[2], row_h, |ui| {
+                                ui.add(egui::Label::new(n.profile_string()).truncate());
+                            });
+                            table_cell(ui, col_w[3], row_h, |ui| {
+                                ui.add(egui::Label::new(n.detected_bitrates_string()).truncate());
+                            });
+                        });
+                    });
+
+                    if row.response.interact(egui::Sense::click()).clicked() {
+                        self.select_node(id);
+                    }
+                    row.response.context_menu(|ui| {
+                        if ui.button("Select").clicked() {
+                            self.select_node(id);
+                            ui.close_menu();
                         }
                     });
+                }
             });
     }
 
     fn select_node(&mut self, id: u8) {
         self.selected_node_id = Some(id);
-        self.new_node_id = format!("{}", id.saturating_add(1).min(127));
+        self.new_node_id = format!("{id}");
+        self.reset_apply_baselines();
+    }
+
+    fn reset_apply_baselines(&mut self) {
+        self.node_id_apply_baseline = self.new_node_id.clone();
+        self.bitrate_apply_baseline = self.new_bitrate;
+        self.node_id_apply_after = None;
+        self.bitrate_apply_after = None;
+        self.node_id_apply_armed_for = None;
+        self.bitrate_apply_armed_for = None;
+    }
+
+    fn update_apply_debounce(&mut self, now: Instant) {
+        const DELAY: Duration = Duration::from_secs(1);
+        if self.new_node_id != self.node_id_apply_baseline {
+            if self.node_id_apply_armed_for.as_deref() != Some(self.new_node_id.as_str()) {
+                self.node_id_apply_armed_for = Some(self.new_node_id.clone());
+                self.node_id_apply_after = Some(now + DELAY);
+            }
+        } else {
+            self.node_id_apply_armed_for = None;
+            self.node_id_apply_after = None;
+        }
+        if self.new_bitrate != self.bitrate_apply_baseline {
+            if self.bitrate_apply_armed_for != Some(self.new_bitrate) {
+                self.bitrate_apply_armed_for = Some(self.new_bitrate);
+                self.bitrate_apply_after = Some(now + DELAY);
+            }
+        } else {
+            self.bitrate_apply_armed_for = None;
+            self.bitrate_apply_after = None;
+        }
+    }
+
+    fn node_id_apply_ready(&self, now: Instant) -> bool {
+        self.node_id_apply_after
+            .is_some_and(|t| now >= t)
+    }
+
+    fn bitrate_apply_ready(&self, now: Instant) -> bool {
+        self.bitrate_apply_after
+            .is_some_and(|t| now >= t)
+    }
+
+    fn commit_node_id_apply_baseline(&mut self) {
+        self.node_id_apply_baseline = self.new_node_id.clone();
+        self.node_id_apply_after = None;
+        self.node_id_apply_armed_for = None;
+    }
+
+    fn commit_bitrate_apply_baseline(&mut self) {
+        self.bitrate_apply_baseline = self.new_bitrate;
+        self.bitrate_apply_after = None;
+        self.bitrate_apply_armed_for = None;
     }
 
     fn cycle_node(&mut self, ids: &[u8], dir: i32) {
@@ -440,16 +619,89 @@ impl NodeConfigPanel {
         self.select_node(ids[next]);
     }
 
-    fn show_node_details(&self, ui: &mut Ui, n: &ObservedNode) {
-        ui.label(format!("Vendor: {}", n.vendor_string()));
-        ui.label(format!("Profile: {}", n.profile_string()));
-        ui.label(format!("Product: {}", n.product_string()));
-        ui.label(format!("Seen at: {}", n.detected_bitrates_string()));
-        if let Some(r) = n.identity.revision {
-            ui.label(format!("Revision: 0x{r:08X}"));
+    /// SDO fields and hints not shown in the observed-node table (Vendor/Profile/Bitrates are there).
+    fn show_node_extra_details(&self, ui: &mut Ui, n: &ObservedNode, host_bitrate: Option<u32>) {
+        let has_revision = n.identity.revision.is_some();
+        let has_serial = n.identity.serial.is_some();
+        let has_product = n.identity.product_code.is_some();
+        let bitrate_hint = preferred_operation_bitrate(n, host_bitrate).is_some();
+
+        if !has_revision && !has_serial && !has_product && !bitrate_hint {
+            return;
         }
-        if let Some(s) = n.identity.serial {
-            ui.label(format!("Serial: 0x{s:08X}"));
+
+        ui.collapsing("More from SDO (0x1018 / 0x1000)", |ui| {
+            if has_product {
+                ui.label(format!("Product code: {}", n.product_string()));
+            }
+            if let Some(r) = n.identity.revision {
+                ui.label(format!("Revision: 0x{r:08X}"));
+            }
+            if let Some(s) = n.identity.serial {
+                ui.label(format!("Serial: 0x{s:08X}"));
+            }
+            if let Some(target) = preferred_operation_bitrate(n, host_bitrate) {
+                ui.weak(format!(
+                    "Apply / SDO will set host CAN to {} first.",
+                    format_bitrate_option(target)
+                ));
+            }
+        });
+    }
+
+    fn queue_with_bitrate_align(
+        &mut self,
+        node_scan: &NodeScan,
+        node_id: u8,
+        host: &NodeConfigHostCtx,
+        action: NodeConfigAction,
+    ) {
+        if let Some(n) = node_scan.get(node_id) {
+            if let Some(target) = preferred_operation_bitrate(n, host.host_bitrate) {
+                if !host.can_align_host_bitrate {
+                    self.push_log(
+                        "Error: node was detected at another bitrate; local CAN with sudo password is required to align host bitrate"
+                            .to_string(),
+                    );
+                    return;
+                }
+                self.pending_actions.push(NodeConfigAction::SetHostBitrate {
+                    bps: target,
+                    node_id,
+                    detected_summary: n.detected_bitrates_string(),
+                });
+            }
+        }
+        self.pending_actions.push(action);
+    }
+
+    pub(crate) fn execute_action(
+        &mut self,
+        action: NodeConfigAction,
+        write_sender: &mpsc::Sender<WriteCommand>,
+    ) {
+        match action {
+            NodeConfigAction::SetHostBitrate { .. } => {}
+            NodeConfigAction::RunConfigScript { steps, node_id } => {
+                self.run_steps(write_sender, steps, node_id);
+            }
+            NodeConfigAction::SendGenericSdoDownload {
+                node_id,
+                index,
+                subindex,
+                data,
+            } => {
+                let _ = write_sender.try_send(WriteCommand::SendSdoDownload {
+                    node_id,
+                    index,
+                    subindex,
+                    data: data.clone(),
+                });
+                self.track_op(node_id, index, subindex, "Generic SDO download");
+                self.push_log(format!(
+                    "Sent SDO download 0x{index:04X}:{subindex:02X} to node {node_id}"
+                ));
+            }
         }
     }
 
@@ -600,12 +852,14 @@ impl NodeConfigPanel {
         &mut self,
         write_sender: mpsc::Sender<WriteCommand>,
         node_scan: &mut NodeScan,
+        host_bitrate: Option<u32>,
     ) {
         const NODES: u64 = 127;
         const REQS_PER_NODE: u64 = 5;
         let estimated_ms = NODES * REQS_PER_NODE * ACTIVE_SCAN_THROTTLE_MS + 500;
 
         node_scan.clear();
+        node_scan.assumed_bitrate = host_bitrate;
         self.active_scan_running = true;
         self.active_scan_expected_end_at =
             Some(Instant::now() + Duration::from_millis(estimated_ms));
@@ -634,12 +888,13 @@ impl NodeConfigPanel {
         });
     }
 
-    fn poll_active_scan(&mut self) {
+    fn poll_active_scan(&mut self, node_scan: &mut NodeScan) {
         if self.active_scan_running {
             if let Some(end) = self.active_scan_expected_end_at {
                 if Instant::now() >= end {
                     self.active_scan_running = false;
                     self.active_scan_expected_end_at = None;
+                    node_scan.assumed_bitrate = None;
                     self.push_log("Active bus scan finished".to_string());
                 }
             }
@@ -688,6 +943,47 @@ fn le_bytes_to_u32(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(tmp)
 }
 
+fn node_table_column_widths(table_w: f32) -> [f32; 4] {
+    let id_w = (table_w * NODE_TABLE_COL_FRACS[0]).clamp(24.0, 36.0);
+    let mut vendor_w = table_w * NODE_TABLE_COL_FRACS[1];
+    let mut profile_w = table_w * NODE_TABLE_COL_FRACS[2];
+    let mut bitrates_w = table_w * NODE_TABLE_COL_FRACS[3];
+    let used = id_w + vendor_w + profile_w + bitrates_w;
+    if used > table_w {
+        let scale = table_w / used;
+        vendor_w *= scale;
+        profile_w *= scale;
+        bitrates_w *= scale;
+    } else {
+        vendor_w += table_w - used;
+    }
+    [id_w, vendor_w, profile_w, bitrates_w]
+}
+
+fn table_cell<R>(ui: &mut egui::Ui, width: f32, height: f32, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, height),
+        egui::Layout::top_down(egui::Align::Center),
+        add_contents,
+    )
+    .inner
+}
+
+fn grid_empty_row(ui: &mut egui::Ui, width: f32) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 0.0),
+        egui::Layout::top_down(egui::Align::Center),
+        |ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("No nodes yet — wait for traffic or run a scan").weak(),
+                )
+                .wrap(),
+            );
+        },
+    );
+}
+
 fn format_bitrate_option(bps: u32) -> String {
     for (rate, label) in CLI_BITRATES {
         if *rate == bps {
@@ -702,6 +998,14 @@ fn format_bitrate_option(bps: u32) -> String {
     }
 }
 
+fn inferred_device_bitrate(node: &ObservedNode, host_bps: Option<u32>) -> Option<u32> {
+    match node.detected_bitrates.as_slice() {
+        [one] => Some(*one),
+        [] => host_bps,
+        _ => host_bps.filter(|h| node.detected_bitrates.contains(h)),
+    }
+}
+
 fn show_steps_collapsing(
     ui: &mut egui::Ui,
     id_salt: &str,
@@ -709,32 +1013,47 @@ fn show_steps_collapsing(
     steps: Result<Vec<ConfigStep>, String>,
 ) {
     let header = match &steps {
+        Ok(s) if s.is_empty() => format!("Commands ({target_summary}) — no changes"),
         Ok(s) => format!("Commands ({target_summary}) — {} step(s)", s.len()),
-        Err(e) => format!("Commands ({target_summary}) — {e}"),
+        Err(_) => format!("Commands ({target_summary})"),
     };
 
     egui::CollapsingHeader::new(header)
         .id_salt(id_salt)
-        .show(ui, |ui| match steps {
-            Ok(s) => {
-                for (i, step) in s.iter().enumerate() {
-                    let raw = write_command_raw(&step.command);
-                    let line = if step.delay_ms > 0 {
-                        format!("{raw} — wait {} ms", step.delay_ms)
-                    } else {
-                        raw
-                    };
-                    ui.horizontal(|ui| {
-                        ui.monospace(format!("{}.", i + 1));
-                        ui.vertical(|ui| {
-                            ui.monospace(line);
-                            ui.weak(&step.label);
-                        });
-                    });
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            match steps {
+                Ok(s) if s.is_empty() => {
+                    ui.weak("Nothing to apply — target already matches the current value.");
                 }
-            }
-            Err(e) => {
-                ui.colored_label(egui::Color32::LIGHT_RED, e);
+                Ok(s) => {
+                    for (i, step) in s.iter().enumerate() {
+                        let raw = write_command_raw(&step.command);
+                        let line = if step.delay_ms > 0 {
+                            format!("{raw} — wait {} ms", step.delay_ms)
+                        } else {
+                            raw
+                        };
+                        ui.horizontal_top(|ui| {
+                            ui.set_width(ui.available_width());
+                            ui.monospace(format!("{}.", i + 1));
+                            ui.vertical(|ui| {
+                                ui.set_width(ui.available_width());
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(line).monospace())
+                                        .wrap(),
+                                );
+                                ui.weak(&step.label);
+                            });
+                        });
+                    }
+                }
+                Err(e) => {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(e).color(egui::Color32::LIGHT_RED))
+                            .wrap(),
+                    );
+                }
             }
         });
 }

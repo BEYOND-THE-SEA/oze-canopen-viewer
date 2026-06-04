@@ -176,6 +176,9 @@ pub fn build_change_node_id_steps(
     if !is_valid_node_id(new_node_id) {
         return Err("Node ID must be between 1 and 127".to_string());
     }
+    if new_node_id == current_node_id {
+        return Ok(vec![]);
+    }
 
     let mut steps = Vec::new();
 
@@ -252,7 +255,12 @@ pub fn build_change_bitrate_steps(
     profile: DeviceProfile,
     current_node_id: u8,
     new_bitrate: u32,
+    current_bitrate: Option<u32>,
 ) -> Result<Vec<ConfigStep>, String> {
+    if current_bitrate == Some(new_bitrate) {
+        return Ok(vec![]);
+    }
+
     let mut steps = Vec::new();
 
     match profile {
@@ -518,9 +526,23 @@ mod tests {
     }
 
     #[test]
+    fn node_id_no_change_returns_empty() {
+        let steps = build_change_node_id_steps(DeviceProfile::BaumerEam300b, 7, 7).unwrap();
+        assert!(steps.is_empty());
+    }
+
+    #[test]
+    fn bitrate_no_change_returns_empty() {
+        let steps =
+            build_change_bitrate_steps(DeviceProfile::Sensy, 3, 250_000, Some(250_000)).unwrap();
+        assert!(steps.is_empty());
+    }
+
+    #[test]
     fn sensy_bitrate_mapping() {
         assert_eq!(sensy_bitrate_code(250_000), Some(0x04));
-        let steps = build_change_bitrate_steps(DeviceProfile::Sensy, 3, 250_000).unwrap();
+        let steps =
+            build_change_bitrate_steps(DeviceProfile::Sensy, 3, 250_000, Some(125_000)).unwrap();
         assert!(steps[0].label.contains("0x2001"));
     }
 

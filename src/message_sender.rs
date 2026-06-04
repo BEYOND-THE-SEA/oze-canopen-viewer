@@ -96,6 +96,7 @@ impl MessageSender {
     }
     
     pub fn ui(&mut self, ui: &mut Ui) {
+        let field_w = flex_field_width(ui, 120.0);
         ui.group(|ui| {
             ui.heading("📤 Send CAN Message");
             ui.separator();
@@ -123,16 +124,16 @@ impl MessageSender {
                     self.show_nmt_ui(ui);
                 }
                 MessageType::Pdo => {
-                    self.show_pdo_ui(ui);
+                    self.show_pdo_ui(ui, field_w);
                 }
                 MessageType::Sdo => {
-                    self.show_sdo_ui(ui);
+                    self.show_sdo_ui(ui, field_w);
                 }
                 MessageType::PdoConfig => {
                     self.show_pdo_config_ui(ui);
                 }
                 MessageType::Raw => {
-                    self.show_raw_ui(ui);
+                    self.show_raw_ui(ui, field_w);
                 }
             }
         });
@@ -187,18 +188,18 @@ impl MessageSender {
         }
     }
     
-    fn show_pdo_ui(&mut self, ui: &mut Ui) {
+    fn show_pdo_ui(&mut self, ui: &mut Ui, field_w: f32) {
         ui.horizontal(|ui| {
             ui.label("COB-ID (hex):");
             ui.add(TextEdit::singleline(&mut self.raw_cob_id)
-                .desired_width(100.0)
+                .desired_width(70.0)
                 .hint_text("180"));
         });
         
         ui.horizontal(|ui| {
             ui.label("Data (hex):");
             ui.add(TextEdit::singleline(&mut self.raw_data)
-                .desired_width(250.0)
+                .desired_width(field_w)
                 .hint_text("00 11 22 33 44 55 66 77"));
         });
         
@@ -222,18 +223,18 @@ impl MessageSender {
         }
     }
     
-    fn show_raw_ui(&mut self, ui: &mut Ui) {
+    fn show_raw_ui(&mut self, ui: &mut Ui, field_w: f32) {
         ui.horizontal(|ui| {
             ui.label("COB-ID (hex):");
             ui.add(TextEdit::singleline(&mut self.raw_cob_id)
-                .desired_width(100.0)
+                .desired_width(70.0)
                 .hint_text("123"));
         });
         
         ui.horizontal(|ui| {
             ui.label("Data (hex):");
             ui.add(TextEdit::singleline(&mut self.raw_data)
-                .desired_width(250.0)
+                .desired_width(field_w)
                 .hint_text("00 11 22 33 44 55 66 77"));
         });
         
@@ -257,7 +258,7 @@ impl MessageSender {
         }
     }
     
-    fn show_sdo_ui(&mut self, ui: &mut Ui) {
+    fn show_sdo_ui(&mut self, ui: &mut Ui, field_w: f32) {
         // CIA 402 preset selector
         ui.horizontal(|ui| {
             ui.label("CIA 402 Preset:");
@@ -317,7 +318,7 @@ impl MessageSender {
         ui.horizontal(|ui| {
             ui.label("Index (hex):");
             ui.add(TextEdit::singleline(&mut self.sdo_index)
-                .desired_width(100.0)
+                .desired_width(70.0)
                 .hint_text("6040"));
         });
         
@@ -331,7 +332,7 @@ impl MessageSender {
         ui.horizontal(|ui| {
             ui.label("Data (hex, ≤4 bytes):");
             ui.add(TextEdit::singleline(&mut self.sdo_data)
-                .desired_width(200.0)
+                .desired_width(field_w)
                 .hint_text("06 00"));
         });
         
@@ -415,6 +416,12 @@ impl MessageSender {
 }
 
 /// Parse hex data string like "00 11 22" or "001122" into Vec<u8>
+/// Width for text fields: shrinks with a narrow panel, never requests more than `preferred`.
+fn flex_field_width(ui: &Ui, preferred: f32) -> f32 {
+    let room = (ui.available_width() - 90.0).max(0.0);
+    preferred.min(room).max(40.0)
+}
+
 fn parse_hex_data(s: &str) -> Result<Vec<u8>, String> {
     let cleaned: String = s.chars().filter(|c| !c.is_whitespace()).collect();
     
