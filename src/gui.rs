@@ -134,8 +134,7 @@ struct MultiBitrateScan {
     phase: MultiBitratePhase,
     deadline: Instant,
     current_bps: u32,
-    nodes_found_this_step: Vec<u8>,
-    probe_index: usize,
+    passive_snapshot: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,8 +143,8 @@ enum MultiBitratePhase {
     WaitLink,
     NmtBroadcast,
     Listen,
-    SdoProbe,
     RestoreHostBitrate,
+    FinalIdentityProbe,
     Done,
 }
 
@@ -223,10 +222,7 @@ impl Gui {
     }
 
     pub fn bootup_listen_bitrate(&self) -> Option<u32> {
-        match &self.multi_bitrate_scan {
-            Some(s) if s.phase == MultiBitratePhase::Listen => Some(s.current_bps),
-            _ => None,
-        }
+        self.node_scan.discovery_listen_bps
     }
 
     fn begin_multi_bitrate_scan(&mut self) {
@@ -243,7 +239,8 @@ impl Gui {
         }
 
         let restore = self.selected_bitrate.unwrap_or(250_000);
-        self.node_scan.clear();
+        let passive_snapshot = self.node_scan.passive_node_ids();
+        self.node_scan.prepare_multi_bitrate_scan();
         self.node_config_panel.push_log(format!(
             "Multi-bitrate scan started (restore {restore} bit/s after)"
         ));
@@ -255,8 +252,7 @@ impl Gui {
             phase: MultiBitratePhase::SetHostBitrate,
             deadline: Instant::now(),
             current_bps: CLI_BITRATES[0].0,
-            nodes_found_this_step: Vec::new(),
-            probe_index: 0,
+            passive_snapshot,
         });
         self.node_config_panel.multi_bitrate_status =
             Some("Preparing multi-bitrate scan...".to_string());
@@ -291,7 +287,8 @@ impl Gui {
                 match self.set_host_bitrate(bps) {
                     Ok(()) => {
                         scan.phase = MultiBitratePhase::WaitLink;
-                        scan.deadline = now + std::time::Duration::from_millis(400);
+                        scan.deadline = now
+                            + std::time::Duration::from_millis(crate::node_discovery::SCAN_WAIT_LINK_MS);
                         self.node_config_panel
                             .push_log(format!("Host CAN set to {label}"));
                     }
@@ -317,69 +314,43 @@ impl Gui {
                     node_id: 0,
                     command: NmtCommandSpecifier::ResetNode,
                 });
-                scan.nodes_found_this_step.clear();
+                self.node_scan
+                    .set_discovery_listen(Some(scan.current_bps));
                 scan.phase = MultiBitratePhase::Listen;
-                scan.deadline = now + std::time::Duration::from_millis(1000);
+                scan.deadline =
+                    now + std::time::Duration::from_millis(crate::node_discovery::SCAN_LISTEN_MS);
                 self.node_config_panel.push_log(format!(
                     "NMT ResetNode @ {} — listening for boot-up",
                     format_bitrate_label(scan.current_bps)
                 ));
             }
             MultiBitratePhase::Listen => {
+                use crate::node_discovery::union_scan_targets;
+                self.node_scan.set_discovery_listen(None);
                 let current_bps = scan.current_bps;
-                let found: Vec<u8> = self
-                    .node_scan
-                    .node_ids_sorted()
-                    .into_iter()
-                    .filter(|id| {
+                if current_bps == scan.restore_bitrate {
+                    for id in &scan.passive_snapshot {
                         self.node_scan
-                            .get(*id)
-                            .map(|n| n.detected_bitrates.contains(&current_bps))
-                            .unwrap_or(false)
-                    })
-                    .collect();
-                scan.nodes_found_this_step = found.clone();
+                            .mark_detected_at_bitrate(*id, current_bps);
+                    }
+                }
+                let found = union_scan_targets(
+                    &self.node_scan,
+                    Some(current_bps),
+                    &scan.passive_snapshot,
+                );
                 self.node_config_panel.push_log(format!(
                     "{}: {} node(s) detected",
                     format_bitrate_label(current_bps),
                     found.len()
                 ));
-                if found.is_empty() {
-                    scan.index += 1;
-                    scan.phase = if scan.index >= scan.bitrates.len() {
-                        MultiBitratePhase::RestoreHostBitrate
-                    } else {
-                        MultiBitratePhase::SetHostBitrate
-                    };
-                    scan.deadline = now;
+                scan.index += 1;
+                scan.phase = if scan.index >= scan.bitrates.len() {
+                    MultiBitratePhase::RestoreHostBitrate
                 } else {
-                    scan.probe_index = 0;
-                    scan.phase = MultiBitratePhase::SdoProbe;
-                    scan.deadline = now + std::time::Duration::from_millis(50);
-                }
-            }
-            MultiBitratePhase::SdoProbe => {
-                if scan.probe_index < scan.nodes_found_this_step.len() {
-                    let node_id = scan.nodes_found_this_step[scan.probe_index];
-                    let sender = self.write_sender.clone();
-                    for (index, sub) in [(0x1018u16, 1u8), (0x1000, 0)] {
-                        let _ = sender.try_send(WriteCommand::SendSdoUpload {
-                            node_id,
-                            index,
-                            subindex: sub,
-                        });
-                    }
-                    scan.probe_index += 1;
-                    scan.deadline = now + std::time::Duration::from_millis(80);
-                } else {
-                    scan.index += 1;
-                    scan.phase = if scan.index >= scan.bitrates.len() {
-                        MultiBitratePhase::RestoreHostBitrate
-                    } else {
-                        MultiBitratePhase::SetHostBitrate
-                    };
-                    scan.deadline = now + std::time::Duration::from_millis(200);
-                }
+                    MultiBitratePhase::SetHostBitrate
+                };
+                scan.deadline = now;
             }
             MultiBitratePhase::RestoreHostBitrate => {
                 let restore = scan.restore_bitrate;
@@ -395,14 +366,28 @@ impl Gui {
                             .push_log(format!("Failed to restore host bitrate: {e}"));
                     }
                 }
-                let ids = self.node_scan.node_ids_sorted();
-                if ids.len() == 1 {
-                    self.node_config_panel.selected_node_id = Some(ids[0]);
-                }
                 self.node_config_panel
-                    .push_log("Multi-bitrate scan finished".to_string());
-                self.node_config_panel.multi_bitrate_status = None;
-                return;
+                    .start_post_multi_identity_probe(&self.node_scan);
+                self.node_config_panel.multi_bitrate_status =
+                    Some("Reading node identity (SDO)...".to_string());
+                scan.phase = MultiBitratePhase::FinalIdentityProbe;
+                scan.deadline = now;
+            }
+            MultiBitratePhase::FinalIdentityProbe => {
+                if self
+                    .node_config_panel
+                    .poll_identity_probe(&self.write_sender)
+                {
+                    let ids = self.node_scan.node_ids_sorted();
+                    if ids.len() == 1 {
+                        self.node_config_panel.selected_node_id = Some(ids[0]);
+                    }
+                    self.node_config_panel
+                        .push_log("Multi-bitrate scan finished".to_string());
+                    self.node_config_panel.multi_bitrate_status = None;
+                    return;
+                }
+                scan.deadline = now + std::time::Duration::from_millis(50);
             }
             MultiBitratePhase::Done => {}
         }

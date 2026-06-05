@@ -6,6 +6,10 @@ use crate::{
         resolve_profile, spawn_config_script, write_command_raw, ConfigStep, DeviceProfile,
         CLI_BITRATES,
     },
+    node_discovery::{
+        union_scan_targets, IDENTITY_SDO_FULL, IDENTITY_SDO_VENDOR, SCAN_LISTEN_MS,
+        SCAN_SDO_TIMEOUT_MS,
+    },
     node_scan::{preferred_operation_bitrate, NodeScan, ObservedNode},
 };
 use egui::{Button, ComboBox, Layout, ScrollArea, TextEdit, Ui};
@@ -15,7 +19,6 @@ use tokio::{sync::mpsc, time::Duration, time::Instant};
 
 const LOG_MAX: usize = 80;
 const OP_TIMEOUT_SECS: f32 = 2.0;
-const ACTIVE_SCAN_THROTTLE_MS: u64 = 8;
 /// Fixed height for the operation log strip at the bottom of the panel.
 const OPERATION_LOG_HEIGHT: f32 = 300.0;
 
@@ -40,6 +43,33 @@ struct PendingOp {
     subindex: u8,
     started_at: Instant,
     label: String,
+    /// Scan identity probes use a shorter timeout than generic ops.
+    scan_probe: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BusScanPhase {
+    NmtReset,
+    Listen,
+    IdentityProbe,
+    Done,
+}
+
+#[derive(Debug)]
+struct BusScanState {
+    phase: BusScanPhase,
+    deadline: Instant,
+    host_bitrate: Option<u32>,
+    passive_snapshot: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct IdentityProbeState {
+    targets: Vec<u8>,
+    target_idx: usize,
+    sdo_idx: usize,
+    objects: &'static [(u16, u8)],
+    finish_log: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,8 +125,8 @@ pub struct NodeConfigPanel {
     operation_log: VecDeque<String>,
     pending_ops: Vec<PendingOp>,
     status_message: Option<String>,
-    active_scan_running: bool,
-    active_scan_expected_end_at: Option<Instant>,
+    bus_scan: Option<BusScanState>,
+    identity_probe: Option<IdentityProbeState>,
     /// Set by UI when user clicks "Scan all bitrates"; consumed by Gui.
     pub request_multi_bitrate_scan: bool,
     /// Progress label while Gui runs multi-bitrate scan.
@@ -126,8 +156,8 @@ impl Default for NodeConfigPanel {
             operation_log: VecDeque::new(),
             pending_ops: Vec::new(),
             status_message: None,
-            active_scan_running: false,
-            active_scan_expected_end_at: None,
+            bus_scan: None,
+            identity_probe: None,
             request_multi_bitrate_scan: false,
             multi_bitrate_status: None,
             any_scan_running: false,
@@ -162,9 +192,10 @@ impl NodeConfigPanel {
         local_can_scan_enabled: bool,
         host: &NodeConfigHostCtx,
     ) {
-        self.poll_active_scan(node_scan);
-        self.any_scan_running =
-            self.active_scan_running || self.multi_bitrate_status.is_some();
+        self.poll_active_scan(node_scan, write_sender);
+        self.any_scan_running = self.bus_scan.is_some()
+            || self.identity_probe.is_some()
+            || self.multi_bitrate_status.is_some();
 
         let panel_w = ui.available_width().min(LEFT_PANEL_LAYOUT_MAX_WIDTH);
 
@@ -207,7 +238,7 @@ impl NodeConfigPanel {
         if self.any_scan_running {
             let status = if let Some(ref st) = self.multi_bitrate_status {
                 st.as_str()
-            } else if self.active_scan_running {
+            } else if self.bus_scan.is_some() || self.identity_probe.is_some() {
                 "Bus scan running…"
             } else {
                 ""
@@ -745,12 +776,28 @@ impl NodeConfigPanel {
     }
 
     fn track_op(&mut self, node_id: u8, index: u16, subindex: u8, label: &str) {
+        self.track_op_inner(node_id, index, subindex, label, false);
+    }
+
+    fn track_scan_op(&mut self, node_id: u8, index: u16, subindex: u8, label: &str) {
+        self.track_op_inner(node_id, index, subindex, label, true);
+    }
+
+    fn track_op_inner(
+        &mut self,
+        node_id: u8,
+        index: u16,
+        subindex: u8,
+        label: &str,
+        scan_probe: bool,
+    ) {
         self.pending_ops.push(PendingOp {
             node_id,
             index,
             subindex,
             started_at: Instant::now(),
             label: label.to_string(),
+            scan_probe,
         });
     }
 
@@ -791,6 +838,7 @@ impl NodeConfigPanel {
                                 u.index, u.subindex
                             ));
                         }
+                        self.resolve_pending(node_id, u.index, u.subindex, true, None, now);
                     }
                     _ => {}
                 }
@@ -799,7 +847,12 @@ impl NodeConfigPanel {
 
         let mut timed_out: Vec<PendingOp> = Vec::new();
         self.pending_ops.retain(|op| {
-            if now.duration_since(op.started_at).as_secs_f32() >= OP_TIMEOUT_SECS {
+            let limit = if op.scan_probe {
+                SCAN_SDO_TIMEOUT_MS as f32 / 1000.0
+            } else {
+                OP_TIMEOUT_SECS
+            };
+            if now.duration_since(op.started_at).as_secs_f32() >= limit {
                 timed_out.push(op.clone());
                 false
             } else {
@@ -850,54 +903,191 @@ impl NodeConfigPanel {
 
     pub fn start_active_scan(
         &mut self,
-        write_sender: mpsc::Sender<WriteCommand>,
+        _write_sender: mpsc::Sender<WriteCommand>,
         node_scan: &mut NodeScan,
         host_bitrate: Option<u32>,
     ) {
-        const NODES: u64 = 127;
-        const REQS_PER_NODE: u64 = 5;
-        let estimated_ms = NODES * REQS_PER_NODE * ACTIVE_SCAN_THROTTLE_MS + 500;
-
-        node_scan.clear();
+        let passive_snapshot = node_scan.passive_node_ids();
         node_scan.assumed_bitrate = host_bitrate;
-        self.active_scan_running = true;
-        self.active_scan_expected_end_at =
-            Some(Instant::now() + Duration::from_millis(estimated_ms));
-        self.push_log("Active bus scan started".to_string());
+        node_scan.set_discovery_listen(None);
 
-        tokio::spawn(async move {
-            for node_id in 1u8..=127u8 {
-                let requests: &[(u16, u8)] = &[
-                    (0x1000, 0x00),
-                    (0x1018, 0x01),
-                    (0x1018, 0x02),
-                    (0x1018, 0x03),
-                    (0x1018, 0x04),
-                ];
-                for (index, sub) in requests {
-                    let _ = write_sender
-                        .send(WriteCommand::SendSdoUpload {
-                            node_id,
-                            index: *index,
-                            subindex: *sub,
-                        })
-                        .await;
-                    tokio::time::sleep(Duration::from_millis(ACTIVE_SCAN_THROTTLE_MS)).await;
-                }
-            }
+        self.bus_scan = Some(BusScanState {
+            phase: BusScanPhase::NmtReset,
+            deadline: Instant::now(),
+            host_bitrate,
+            passive_snapshot,
+        });
+        self.identity_probe = None;
+        self.push_log("Bus scan started (discover → identity SDO)".to_string());
+    }
+
+    /// Start identity SDO probe after multi-bitrate discovery completes.
+    pub fn start_post_multi_identity_probe(&mut self, node_scan: &NodeScan) {
+        let targets = node_scan.node_ids_sorted();
+        self.start_identity_probe(
+            targets,
+            IDENTITY_SDO_FULL,
+            "Multi-bitrate identity probe finished".to_string(),
+        );
+    }
+
+    pub fn identity_probe_running(&self) -> bool {
+        self.identity_probe.is_some()
+    }
+
+    /// Returns `true` when the probe queue is empty (finished).
+    pub fn poll_identity_probe(
+        &mut self,
+        write_sender: &mpsc::Sender<WriteCommand>,
+    ) -> bool {
+        let Some(mut probe) = self.identity_probe.take() else {
+            return true;
+        };
+
+        if self.has_pending_scan_op() {
+            self.identity_probe = Some(probe);
+            return false;
+        }
+
+        if probe.target_idx >= probe.targets.len() {
+            self.push_log(probe.finish_log.clone());
+            return true;
+        }
+
+        if probe.sdo_idx >= probe.objects.len() {
+            probe.target_idx += 1;
+            probe.sdo_idx = 0;
+            self.identity_probe = Some(probe);
+            return false;
+        }
+
+        let node_id = probe.targets[probe.target_idx];
+        let (index, sub) = probe.objects[probe.sdo_idx];
+        let label = format!("Scan SDO 0x{index:04X}:{sub:02X} node {node_id}");
+        let _ = write_sender.try_send(WriteCommand::SendSdoUpload {
+            node_id,
+            index,
+            subindex: sub,
+        });
+        self.track_scan_op(node_id, index, sub, &label);
+        probe.sdo_idx += 1;
+        self.identity_probe = Some(probe);
+        false
+    }
+
+    fn start_identity_probe(
+        &mut self,
+        targets: Vec<u8>,
+        objects: &'static [(u16, u8)],
+        finish_log: String,
+    ) {
+        if targets.is_empty() {
+            self.push_log(format!("{finish_log} (no nodes)"));
+            return;
+        }
+        self.push_log(format!(
+            "Identity probe: {} node(s), {} SDO object(s) each",
+            targets.len(),
+            objects.len()
+        ));
+        self.identity_probe = Some(IdentityProbeState {
+            targets,
+            target_idx: 0,
+            sdo_idx: 0,
+            objects,
+            finish_log,
         });
     }
 
-    fn poll_active_scan(&mut self, node_scan: &mut NodeScan) {
-        if self.active_scan_running {
-            if let Some(end) = self.active_scan_expected_end_at {
-                if Instant::now() >= end {
-                    self.active_scan_running = false;
-                    self.active_scan_expected_end_at = None;
-                    node_scan.assumed_bitrate = None;
-                    self.push_log("Active bus scan finished".to_string());
+    fn has_pending_scan_op(&self) -> bool {
+        self.pending_ops.iter().any(|op| op.scan_probe)
+    }
+
+    fn poll_active_scan(&mut self, node_scan: &mut NodeScan, write_sender: &mpsc::Sender<WriteCommand>) {
+        if self.bus_scan.is_some() {
+            self.poll_bus_scan(node_scan, write_sender);
+        } else if self.identity_probe.is_some() {
+            let _ = self.poll_identity_probe(write_sender);
+        }
+    }
+
+    fn poll_bus_scan(&mut self, node_scan: &mut NodeScan, write_sender: &mpsc::Sender<WriteCommand>) {
+        let Some(mut scan) = self.bus_scan.take() else {
+            return;
+        };
+
+        if scan.phase == BusScanPhase::Done {
+            return;
+        }
+
+        if scan.phase == BusScanPhase::IdentityProbe {
+            if self.identity_probe.is_some() {
+                let done = self.poll_identity_probe(write_sender);
+                if !done {
+                    self.bus_scan = Some(BusScanState {
+                        phase: BusScanPhase::IdentityProbe,
+                        deadline: Instant::now(),
+                        host_bitrate: scan.host_bitrate,
+                        passive_snapshot: scan.passive_snapshot,
+                    });
                 }
             }
+            node_scan.assumed_bitrate = None;
+            node_scan.set_discovery_listen(None);
+            return;
+        }
+
+        let now = Instant::now();
+        if now < scan.deadline {
+            self.bus_scan = Some(scan);
+            return;
+        }
+
+        match scan.phase {
+            BusScanPhase::NmtReset => {
+                let _ = write_sender.try_send(WriteCommand::SendNmt {
+                    node_id: 0,
+                    command: oze_canopen::proto::nmt::NmtCommandSpecifier::ResetNode,
+                });
+                node_scan.set_discovery_listen(scan.host_bitrate);
+                scan.phase = BusScanPhase::Listen;
+                scan.deadline = now + Duration::from_millis(SCAN_LISTEN_MS);
+                self.push_log("NMT ResetNode — listening for boot-up / heartbeat".to_string());
+            }
+            BusScanPhase::Listen => {
+                node_scan.set_discovery_listen(None);
+                let mut targets = union_scan_targets(
+                    node_scan,
+                    scan.host_bitrate,
+                    &scan.passive_snapshot,
+                );
+                let objects = if targets.is_empty() && !scan.passive_snapshot.is_empty() {
+                    targets = scan.passive_snapshot.clone();
+                    self.push_log(
+                        "No boot-up seen — fallback SDO vendor on passive node(s)".to_string(),
+                    );
+                    IDENTITY_SDO_VENDOR
+                } else {
+                    IDENTITY_SDO_FULL
+                };
+                self.push_log(format!(
+                    "Discovery done: {} node(s) to probe",
+                    targets.len()
+                ));
+                if targets.is_empty() {
+                    node_scan.assumed_bitrate = None;
+                    self.push_log("Bus scan finished (no nodes discovered)".to_string());
+                    return;
+                }
+                self.start_identity_probe(targets, objects, "Bus scan finished".to_string());
+                scan.phase = BusScanPhase::IdentityProbe;
+                scan.deadline = now;
+            }
+            BusScanPhase::IdentityProbe | BusScanPhase::Done => {}
+        }
+
+        if scan.phase != BusScanPhase::Done {
+            self.bus_scan = Some(scan);
         }
     }
 

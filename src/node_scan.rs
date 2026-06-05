@@ -196,12 +196,33 @@ pub struct NodeScan {
     nodes: BTreeMap<u8, ObservedNode>,
     /// While set (e.g. active SDO bus scan), tag every seen node with this host CAN bitrate.
     pub assumed_bitrate: Option<u32>,
+    /// During discovery listen: tag boot-up frames with this bitrate.
+    pub discovery_listen_bps: Option<u32>,
 }
 
 impl NodeScan {
     pub fn clear(&mut self) {
         self.nodes.clear();
         self.assumed_bitrate = None;
+        self.discovery_listen_bps = None;
+    }
+
+    /// Snapshot node IDs already seen from passive traffic (before an active scan).
+    pub fn passive_node_ids(&self) -> Vec<u8> {
+        self.node_ids_sorted()
+    }
+
+    /// Multi-bitrate scan: keep nodes, clear per-node bitrate tags only.
+    pub fn prepare_multi_bitrate_scan(&mut self) {
+        for node in self.nodes.values_mut() {
+            node.detected_bitrates.clear();
+        }
+        self.assumed_bitrate = None;
+        self.discovery_listen_bps = None;
+    }
+
+    pub fn set_discovery_listen(&mut self, bps: Option<u32>) {
+        self.discovery_listen_bps = bps;
     }
 
     pub fn node_ids_sorted(&self) -> Vec<u8> {
